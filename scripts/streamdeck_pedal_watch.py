@@ -1,32 +1,26 @@
 #!/usr/bin/env python3
 """
-DXL→UR joint teleop using servoJ at ~125 Hz (Freedrive OFF).
-StreamDeck pedal control with **interrupt-first** flow and fast+smooth tracking.
+Optimized DXL→UR joint teleop using GELLO software patterns.
+StreamDeck pedal control with interrupt-first flow and smooth tracking.
 
-Pedal Controls (final mapping):
+Pedal Controls:
 - **Left (4)**  → *Interrupt*: stops URs for external program control
 - **Center (5)**
     • 1st tap → capture baselines, gentle params, prep/align (no streaming yet)
     • 2nd tap → start teleop streaming (full-speed params)
 - **Right (6)** → stop teleop and return to passive
 
-Tuning:
-- Defaults: UR_VMAX=1.4, UR_AMAX=4.0 (override via env)
-- LOOKAHEAD=0.15, GAIN=340 (reduced twitch)
-- **Jerk-limited motion profile** (per-joint vel+acc clamp) + light EMA
-- Smaller deadbands; wrist clamp to avoid chatter
-- Dashboard auto-recover if RTDE script not running
-
-Robust pedal decoding:
-- Handles multiple HID report layouts seen on StreamDeck Pedal
-- Fallback scan + optional --pedal-debug to print raw packets
-- Debounce to avoid double-triggers
+Optimizations based on GELLO software:
+- YAML-based configuration
+- Fixed-rate scheduler with perf_counter
+- Optimized Dynamixel driver with sync read/write
+- Smooth motion profiling
+- Better error handling and recovery
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import socket
 import sys
@@ -34,7 +28,19 @@ import threading
 import time
 from contextlib import closing
 from enum import Enum
-from typing import Any, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import yaml
+
+# Import optimized components
+from hardware.control_loop import (
+    FixedRateScheduler,
+    MotionProfile,
+    SmoothMotionController,
+)
+from hardware.ur_dynamixel_robot import URDynamixelRobot
 
 # Import connection clearing utility
 try:
@@ -52,68 +58,58 @@ except ImportError:
     print("[warn] python-hidapi not installed, pedal control disabled")
     hid = None  # type: ignore
 
-# --- UR RTDE imports ---
-try:
-    from rtde_control import RTDEControlInterface  # type: ignore
-    from rtde_receive import RTDEReceiveInterface  # type: ignore
-except Exception:
-    try:
-        from ur_rtde import rtde_control, rtde_receive  # type: ignore
 
-        RTDEControlInterface = rtde_control.RTDEControlInterface
-        RTDEReceiveInterface = rtde_receive.RTDEReceiveInterface
-    except Exception as e:
-        print("[err] Could not import UR RTDE modules:", e)
-        sys.exit(1)
+# ---------------- Config Management ----------------
+class Config:
+    """Configuration container with defaults."""
 
-# --- Dynamixel SDK ---
-try:
-    from dynamixel_sdk import (  # type: ignore
-        COMM_SUCCESS,
-        GroupBulkRead,
-        PacketHandler,
-        PortHandler,
-    )
-except Exception as e:
-    print("[err] dynamixel_sdk import failed:", e)
-    sys.exit(1)
+    def __init__(self, config_dict: Optional[Dict[str, Any]] = None):
+        if config_dict is None:
+            config_dict = {}
 
-# ---------------- Consts ----------------
-PROTO = 2.0
-ADDR_TORQUE_ENABLE = 64
-ADDR_PRESENT_POSITION = 132
-TPR = 4096  # ticks per revolution (XL330/most X-series)
-CENTER = 2048  # neutral ticks
+        # Extract sub-configs
+        self.left_robot = config_dict.get("left_robot", {})
+        self.right_robot = config_dict.get("right_robot", {})
+        self.dynamixel = config_dict.get("dynamixel", {})
+        self.control = config_dict.get("control", {})
+        self.motion_shaping = config_dict.get("motion_shaping", {})
+        self.pedal = config_dict.get("pedal", {})
+        self.safety = config_dict.get("safety", {})
+        self.debug = config_dict.get("debug", {})
 
-DT = 0.008  # ~125 Hz
-LOOKAHEAD = 0.15  # A bit higher for smoother at speed
-GAIN = 340  # Reduced twitch vs 360/450
+        # Control parameters (with env var override)
+        self.dt = self.control.get("dt", 0.008)
+        self.hz = self.control.get("hz", 125)
+        self.lookahead = self.control.get("lookahead", 0.15)
+        self.gain = self.control.get("gain", 340)
+        self.vmax = float(
+            os.environ.get("UR_VMAX", str(self.control.get("velocity_max", 1.4)))
+        )
+        self.amax = float(
+            os.environ.get("UR_AMAX", str(self.control.get("acceleration_max", 4.0)))
+        )
 
-VMAX = float(os.environ.get("UR_VMAX", "1.4"))  # Faster default
-AMAX = float(os.environ.get("UR_AMAX", "4.0"))  # Faster default
+        # Motion shaping
+        self.ema_alpha = self.motion_shaping.get("ema_alpha", 0.12)
+        self.softstart_time = self.motion_shaping.get("softstart_time", 0.20)
+        self.deadband_deg = self.motion_shaping.get(
+            "deadband_deg", [1, 1, 1, 1, 1, 2, 1]
+        )
+        self.scale = self.motion_shaping.get("scale", [1, 1, 1, 1, 1, 1, 1])
+        self.clamp_rad = self.motion_shaping.get(
+            "clamp_rad", [None, None, None, None, None, 0.8, None]
+        )
 
-# --- Teleop shaping parameters (optimized for minimal lag) ---
-EMA_ALPHA = 0.12  # Lower EMA (let profiler do smoothing)
-SOFTSTART_T = 0.20  # Even shorter soft-start
-DEADBAND_DEG = [1, 1, 1, 1, 1, 2, 1]  # Joints + gripper
-SCALE = [1, 1, 1, 1, 1, 1, 1]  # per-joint gain + gripper
-# Optional absolute clamps (rad) around the baseline UR pose
-CLAMP_RAD = [None, None, None, None, None, 0.8, None]  # Keep wrist tame
+        # Convert degrees to radians
+        self.deadband_rad = [
+            np.radians(d) if d is not None else None for d in self.deadband_deg
+        ]
 
-# Inactivity handling
-INACTIVITY_REBASE_S = 0.3
-REBASE_BETA = 0.10
-SNAP_EPS_RAD = 0.005
-VEL_LIMIT_RAD_S = 6.0  # Per-joint cmd velocity cap
-ACC_LIMIT_RAD_S2 = 40.0  # Per-joint cmd acceleration cap
-
-# Mild assist parameters
-ASSIST_K = 0.03  # Fine-tuned assist
-
-# Pedal button mapping (StreamDeck pedals)
-PEDAL_LEFT = 4  # Interrupt for external program control
-PEDAL_CENTER = 5  # 1st tap: prep/align, 2nd tap: start teleop
-PEDAL_RIGHT = 6  # Stop teleop and return to passive
+        # Pedal mapping
+        button_map = self.pedal.get("button_mapping", {})
+        self.pedal_left = button_map.get("left", 4)
+        self.pedal_center = button_map.get("center", 5)
+        self.pedal_right = button_map.get("right", 6)
 
 
 # -------------- State Management --------------
@@ -124,18 +120,16 @@ class TeleopState(Enum):
 
 
 # -------------- Helpers --------------
-
-
-def _deg_list_to_rad(lst):
-    return [math.radians(x) if x is not None else None for x in lst]
-
-
-DEADBAND_RAD = _deg_list_to_rad(DEADBAND_DEG)
-
-
-def _ticks_to_rad(ticks: int, offset_deg: float, sign: int) -> float:
-    off_ticks = int(round((offset_deg / 360.0) * TPR))
-    return sign * ((ticks - CENTER - off_ticks) * (2 * math.pi / TPR))
+def load_config(config_path: Optional[str]) -> Config:
+    """Load configuration from YAML file or use defaults."""
+    if config_path and Path(config_path).exists():
+        with open(config_path) as f:
+            config_dict = yaml.safe_load(f)
+        print(f"[config] Loaded from {config_path}")
+        return Config(config_dict)
+    else:
+        print("[config] Using default configuration")
+        return Config()
 
 
 def _parse_int_csv(s: str) -> List[int]:
@@ -151,7 +145,9 @@ def _parse_signs(s: Optional[str], n: int, default: Sequence[int]) -> List[int]:
     return vals
 
 
-def _parse_offsets_deg(s: Optional[str], n: int, default: Sequence[float]) -> List[float]:
+def _parse_offsets_deg(
+    s: Optional[str], n: int, default: Sequence[float]
+) -> List[float]:
     if not s:
         return list(default)
     vals = [float(x) for x in s.split(",") if x]
@@ -304,202 +300,43 @@ def _check_external_control(host: str) -> bool:
         return False
 
 
-def _safe_get_q(ur: "URSide") -> Optional[List[float]]:
-    """Safely get current joint positions from UR robot."""
+def _safe_get_q(robot: URDynamixelRobot) -> Optional[np.ndarray]:
+    """Safely get current joint positions from robot."""
     try:
-        if not ur.rcv:
-            ur.ensure_receive()
-        return list(ur.rcv.getActualQ())
+        positions = robot.ur.get_joint_positions()
+        return positions if positions is not None else None
     except Exception:
         return None
 
 
-def _set_gentle_mode():
+def _set_gentle_mode(config: Config) -> Tuple[float, float, float]:
     """Set gentler control parameters for test movements."""
-    global GAIN, VMAX, AMAX
-    GAIN_OLD, VMAX_OLD, AMAX_OLD = GAIN, VMAX, AMAX
-    GAIN, VMAX, AMAX = 220, 0.35, 0.9  # Slightly faster than before but still gentle
-    return GAIN_OLD, VMAX_OLD, AMAX_OLD
+    old_values = (config.gain, config.vmax, config.amax)
+    config.gain, config.vmax, config.amax = (
+        220,
+        0.35,
+        0.9,
+    )  # Slightly faster than before but still gentle
+    return old_values
 
 
-def _restore_mode(old):
+def _restore_mode(config: Config, old_values: Tuple[float, float, float]):
     """Restore original control parameters."""
-    global GAIN, VMAX, AMAX
-    GAIN, VMAX, AMAX = old
+    config.gain, config.vmax, config.amax = old_values
 
 
-class DxlBus:
-    def __init__(
-        self,
-        name: str,
-        port: str,
-        baud: int,
-        ids: List[int],
-        signs: List[int],
-        offsets_deg: List[float],
-    ):
-        self.name = name
-        self.port = port
-        self.baud = baud
-        self.ids = ids
-        self.signs = signs
-        self.offsets_deg = offsets_deg
-        self.ph: Optional[PortHandler] = None
-        self.pk: Optional[PacketHandler] = None
-        self.bulk: Optional[GroupBulkRead] = None
-        self.bulk_warned = False  # Track if we've warned about bulk read failure
-        self.last_read_time = 0.0
-        self.last_positions: Optional[List[float]] = None
-        self.read_dt = 0.008  # 8 ms cache window to match loop period (125Hz)
-
-    def open(self) -> None:
-        self.pk = PacketHandler(PROTO)
-        self.ph = PortHandler(self.port)
-        ok = self.ph.openPort() and self.ph.setBaudRate(self.baud)
-        if not ok:
-            raise RuntimeError(f"open/baud failed for {self.name} @ {self.port} {self.baud}")
-        print(f"[dxl] {self.name}: open {self.port} @ {self.baud}")
-
-        # Prepare bulk reader for all IDs (reduces latency 7x when it works)
-        self.bulk = GroupBulkRead(self.ph, self.pk)
-        for i in self.ids:
-            # addr 132 len 4 = Present Position
-            if not self.bulk.addParam(i, ADDR_PRESENT_POSITION, 4):
-                print(f"[dxl] WARN bulk addParam failed id={i}")
-
-    def close(self) -> None:
-        if self.ph:
-            self.ph.closePort()
-            print(f"[dxl] {self.name}: closed")
-
-    def torque(self, on: bool) -> None:
-        if not self.ph or not self.pk:
-            return
-        val = 1 if on else 0
-        for i in self.ids:
-            rc, er = self.pk.write1ByteTxRx(self.ph, i, ADDR_TORQUE_ENABLE, val)
-            if rc != COMM_SUCCESS or er != 0:
-                print(f"[dxl] torque {'ON' if on else 'OFF'} fail id={i} rc={rc} er={er}")
-
-    def read_present_positions(self) -> Optional[List[float]]:
-        if not self.ph or not self.pk:
-            return None
-
-        # Use cached value if recent enough (reduces latency dramatically)
-        import time
-
-        now = time.monotonic()
-        if self.last_positions and (now - self.last_read_time) < self.read_dt:
-            return self.last_positions
-
-        # Try bulk read first (faster)
-        if self.bulk is not None:
-            if self.bulk.txRxPacket():
-                # Bulk read succeeded
-                out: List[float] = []
-                for j, i in enumerate(self.ids):
-                    if self.bulk.isAvailable(i, ADDR_PRESENT_POSITION, 4):
-                        pos = self.bulk.getData(i, ADDR_PRESENT_POSITION, 4)
-                        out.append(_ticks_to_rad(int(pos), self.offsets_deg[j], self.signs[j]))
-                    else:
-                        # Partial failure, fall back to individual reads
-                        break
-                else:
-                    # All reads succeeded
-                    self.last_positions = out
-                    self.last_read_time = now
-                    return out
-
-        # Fallback to individual reads (slower but more reliable)
-        if not self.bulk_warned:
-            print(f"[dxl] {self.name}: Bulk read failed, using individual reads with 8ms cache")
-            self.bulk_warned = True
-
-        out: List[float] = []
-        for j, i in enumerate(self.ids):
-            pos, rc, er = self.pk.read4ByteTxRx(self.ph, i, ADDR_PRESENT_POSITION)
-            if rc != COMM_SUCCESS or er != 0:
-                # Don't return stale data - surface the error so loop can skip this tick
-                print(f"[dxl] {self.name}: Read failed for ID {i}, rc={rc}, er={er}")
-                self.last_positions = None
-                return None
-            out.append(_ticks_to_rad(int(pos), self.offsets_deg[j], self.signs[j]))
-
-        self.last_positions = out
-        self.last_read_time = now
-        return out
+# DxlBus and URSide classes replaced by URDynamixelRobot from hardware.ur_dynamixel_robot
 
 
-class URSide:
-    def __init__(self, host: str):
-        self.host = host
-        self.rcv: Optional[Any] = None
-        self.ctrl: Optional[Any] = None
-
-    def ensure_receive(self) -> None:
-        if self.rcv is None:
-            self.rcv = RTDEReceiveInterface(self.host)
-
-    def ensure_control(self) -> bool:
-        """Simplified control connection - fast single attempt."""
-        if self.ctrl is not None:
-            try:
-                # Test if existing connection is still alive
-                self.ctrl.getJointTemp()  # Simple test command
-                return True
-            except Exception:
-                # Connection is dead, need to recreate
-                self.ctrl = None
-
-        # Single attempt to connect
-        try:
-            self.ctrl = RTDEControlInterface(self.host)
-            return True
-        except Exception as e:
-            print(f"[ur] {self.host}: Control connection failed: {e}")
-            return False
-
-    def end_teach(self) -> None:
-        try:
-            if self.ctrl:
-                self.ctrl.endTeachMode()
-        except Exception:
-            pass
-
-    def stop_now(self):
-        """Immediately stop the robot with stopJ command."""
-        try:
-            if self.ctrl:
-                self.ctrl.stopJ(AMAX)
-        except Exception:
-            pass
-
-    def disconnect(self) -> None:
-        """Properly disconnect all RTDE interfaces."""
-        # Disconnect control interface
-        if self.ctrl:
-            try:
-                self.ctrl.stopJ(AMAX)  # Stop any motion first
-                self.ctrl.disconnect()
-            except Exception:
-                pass
-            finally:
-                self.ctrl = None
-
-        # Disconnect receive interface
-        if self.rcv:
-            try:
-                self.rcv.disconnect()
-            except Exception:
-                pass
-            finally:
-                self.rcv = None
+# URSide class replaced by URRobot from hardware.ur_dynamixel_robot
 
 
 class PedalMonitor:
     """Monitor StreamDeck pedals for teleop control (robust decoder)."""
 
-    def __init__(self, vendor_id: int = 0x0FD9, product_id: int = 0x0086, debug: bool = False):
+    def __init__(
+        self, vendor_id: int = 0x0FD9, product_id: int = 0x0086, debug: bool = False
+    ):
         """Initialize pedal monitor.
 
         Args:
@@ -525,6 +362,11 @@ class PedalMonitor:
         self.cb_center_1: Optional[Any] = None
         self.cb_center_2: Optional[Any] = None
         self.cb_right: Optional[Any] = None
+
+        # Default button mapping
+        self.PEDAL_LEFT = 4
+        self.PEDAL_CENTER = 5
+        self.PEDAL_RIGHT = 6
 
     def connect(self) -> bool:
         """Connect to pedal device with better error handling."""
@@ -600,7 +442,9 @@ class PedalMonitor:
             except Exception as e:
                 last_error = e
                 if attempt < 2:
-                    print(f"[pedal] Connection attempt {attempt + 1} failed: {e}, retrying...")
+                    print(
+                        f"[pedal] Connection attempt {attempt + 1} failed: {e}, retrying..."
+                    )
                     time.sleep(0.5)
                     continue
 
@@ -641,11 +485,11 @@ class PedalMonitor:
             # Check if we have the byte-per-pedal format
             if any(data[i] in (0, 1) for i in (4, 5, 6)):
                 if data[4] == 1:
-                    btns.add(PEDAL_LEFT)
+                    btns.add(self.PEDAL_LEFT)
                 if data[5] == 1:
-                    btns.add(PEDAL_CENTER)
+                    btns.add(self.PEDAL_CENTER)
                 if data[6] == 1:
-                    btns.add(PEDAL_RIGHT)
+                    btns.add(self.PEDAL_RIGHT)
                 # If we detected buttons this way, return early
                 if btns:
                     return btns
@@ -654,21 +498,21 @@ class PedalMonitor:
         if not btns and n >= 2:
             m = data[1]
             if m & 0x01:
-                btns.add(PEDAL_LEFT)
+                btns.add(self.PEDAL_LEFT)
             if m & 0x02:
-                btns.add(PEDAL_CENTER)
+                btns.add(self.PEDAL_CENTER)
             if m & 0x04:
-                btns.add(PEDAL_RIGHT)
+                btns.add(self.PEDAL_RIGHT)
 
         # Fallback B: bitmask in byte 4 (bits 0..2) - older format
         if not btns and n >= 5:
             m = data[4]
             if m & 0x01:
-                btns.add(PEDAL_LEFT)
+                btns.add(self.PEDAL_LEFT)
             if m & 0x02:
-                btns.add(PEDAL_CENTER)
+                btns.add(self.PEDAL_CENTER)
             if m & 0x04:
-                btns.add(PEDAL_RIGHT)
+                btns.add(self.PEDAL_RIGHT)
 
         return btns
 
@@ -684,18 +528,26 @@ class PedalMonitor:
                     if self.debug:
                         # Only print raw on actual button changes, not constantly
                         current = self._decode_buttons(data)
-                        if current != self.last_buttons and (now - self.last_raw_print) > 0.1:
+                        if (
+                            current != self.last_buttons
+                            and (now - self.last_raw_print) > 0.1
+                        ):
                             # Show raw data but format it better
                             # Map button numbers to names correctly
                             button_names = {4: "LEFT", 5: "CENTER", 6: "RIGHT"}
                             buttons_str = (
                                 ", ".join(
-                                    [f"{b}({button_names.get(b, '?')})" for b in sorted(current)]
+                                    [
+                                        f"{b}({button_names.get(b, '?')})"
+                                        for b in sorted(current)
+                                    ]
                                 )
                                 if current
                                 else "none"
                             )
-                            print(f"[pedal-debug] raw: {list(data[:8])} → buttons: {buttons_str}")
+                            print(
+                                f"[pedal-debug] raw: {list(data[:8])} → buttons: {buttons_str}"
+                            )
                             self.last_raw_print = now
                     self._process_buttons(list(data))
             except Exception:
@@ -739,7 +591,7 @@ class PedalMonitor:
             button = next(iter(added))
             self.last_change_ts = now
 
-            if button == PEDAL_LEFT and self.cb_left:
+            if button == self.PEDAL_LEFT and self.cb_left:
                 print("\n⏸️ [LEFT PEDAL] Interrupt - URs stopped")
                 print("   Purpose: Interrupt for external program control")
                 print("   State: IDLE (ready for new sequence)")
@@ -747,7 +599,7 @@ class PedalMonitor:
                 self.last_left_edge_ts = now  # Track for CENTER suppression
                 self.cb_left()
 
-            elif button == PEDAL_CENTER:
+            elif button == self.PEDAL_CENTER:
                 # Suppress CENTER ghosts after LEFT press
                 if now - self.last_left_edge_ts < self.suppress_center_after_left_s:
                     if self.debug:
@@ -769,7 +621,7 @@ class PedalMonitor:
                         self.cb_center_2()
                         self.state = TeleopState.RUNNING
 
-            elif button == PEDAL_RIGHT and self.cb_right:
+            elif button == self.PEDAL_RIGHT and self.cb_right:
                 print("\n⏹️ [RIGHT PEDAL] Stopping teleop")
                 print("   ✓ Streaming stopped")
                 print("   ✓ GELLO arms now passive")
@@ -783,143 +635,107 @@ class PedalMonitor:
 class FollowThread:
     def __init__(
         self,
-        left: Optional[Tuple[DxlBus, URSide]],
-        right: Optional[Tuple[DxlBus, URSide]],
-        left_prog: Optional[str] = None,
-        right_prog: Optional[str] = None,
+        left_robot: Optional[URDynamixelRobot],
+        right_robot: Optional[URDynamixelRobot],
+        config: Config,
     ):
-        self.left = left
-        self.right = right
-        self.left_prog = left_prog
-        self.right_prog = right_prog
+        self.left_robot = left_robot
+        self.right_robot = right_robot
+        self.config = config
         self._stop = threading.Event()
-        self._th: Optional[threading.Thread] = None
+        self._thread: Optional[threading.Thread] = None
 
-        # baselines: DXL (rad) and UR (rad) captured on center-first
-        self.q0_dxl_L: Optional[List[float]] = None
-        self.q0_ur_L: Optional[List[float]] = None
-        self.q0_dxl_R: Optional[List[float]] = None
-        self.q0_ur_R: Optional[List[float]] = None
+        # Motion controllers
+        profile = MotionProfile(
+            velocity_max=config.vmax,
+            acceleration_max=config.amax,
+            ema_alpha=config.ema_alpha,
+            softstart_time=config.softstart_time,
+            deadband_rad=config.deadband_rad,
+            scale_factors=config.scale,
+            clamp_rad=config.clamp_rad,
+        )
 
-        # softstart timestamps
-        self.t0_L: Optional[float] = None
-        self.t0_R: Optional[float] = None
+        self.left_controller = (
+            SmoothMotionController(
+                num_joints=6,  # UR joints only
+                profile=profile,
+                control_dt=config.dt,
+            )
+            if left_robot
+            else None
+        )
 
-        # Profiled targets and velocities
-        self.y_L: Optional[List[float]] = None
-        self.v_L: Optional[List[float]] = None  # Velocity tracking for left
-        self.y_R: Optional[List[float]] = None
-        self.v_R: Optional[List[float]] = None  # Velocity tracking for right
+        self.right_controller = (
+            SmoothMotionController(
+                num_joints=6,  # UR joints only
+                profile=profile,
+                control_dt=config.dt,
+            )
+            if right_robot
+            else None
+        )
 
-        # inactivity tracking
-        self.last_qL: Optional[List[float]] = None
-        self.last_qR: Optional[List[float]] = None
-        self.last_move_ts_L: float = time.monotonic()
-        self.last_move_ts_R: float = time.monotonic()
+        # Fixed-rate scheduler
+        self.scheduler = FixedRateScheduler(config.hz)
 
-    def _apply_deadband_scale(self, dq: List[float]) -> List[float]:
-        """Apply per-joint deadband and scaling."""
-        out = []
-        for j, v in enumerate(dq):
-            db = DEADBAND_RAD[j] if j < len(DEADBAND_RAD) else 0.0
-            if abs(v) < (db or 0.0):
-                out.append(0.0)
+        # Error tracking
+        self.error_count = {"left": 0, "right": 0}
+        self.max_errors = config.safety.get("max_control_errors", 2)
+
+    def capture_baselines(self):
+        """Capture current positions as baselines."""
+        # Left robot
+        if self.left_robot and self.left_controller:
+            dxl_pos = self.left_robot.dxl.read_positions()
+            ur_pos = self.left_robot.ur.get_joint_positions()
+
+            if dxl_pos is not None and ur_pos is not None:
+                # Only first 6 joints for UR
+                self.left_controller.set_baselines(dxl_pos[:6], ur_pos)
+                print(
+                    f"   ✓ LEFT arm: {len(dxl_pos)} DXL joints, {len(ur_pos)} UR joints captured"
+                )
             else:
-                sc = SCALE[j] if j < len(SCALE) else 1.0
-                out.append(v * sc)
-        return out
+                print("   ✗ LEFT arm: Failed to read positions")
 
-    def _soft_ramp(self, t0: Optional[float]) -> float:
-        """Calculate soft-start ramp factor (0 to 1)."""
-        if not t0:
-            return 1.0
-        dt = max(0.0, time.monotonic() - t0)
-        return min(1.0, dt / max(1e-6, SOFTSTART_T))
+        # Right robot
+        if self.right_robot and self.right_controller:
+            dxl_pos = self.right_robot.dxl.read_positions()
+            ur_pos = self.right_robot.ur.get_joint_positions()
 
-    def _clamp_about(self, base: List[float], q: List[float]) -> List[float]:
-        """Optional absolute clamps around baseline UR pose."""
-        if not CLAMP_RAD or all(c is None for c in CLAMP_RAD):
-            return q
-        out = []
-        for j, val in enumerate(q):
-            c = CLAMP_RAD[j] if j < len(CLAMP_RAD) else None
-            if c is None:
-                out.append(val)
+            if dxl_pos is not None and ur_pos is not None:
+                # Only first 6 joints for UR
+                self.right_controller.set_baselines(dxl_pos[:6], ur_pos)
+                print(
+                    f"   ✓ RIGHT arm: {len(dxl_pos)} DXL joints, {len(ur_pos)} UR joints captured"
+                )
             else:
-                lo = base[j] - c
-                hi = base[j] + c
-                out.append(min(max(val, lo), hi))
-        return out
-
-    def _profile(
-        self, prev_y: Optional[List[float]], prev_v: Optional[List[float]], target: List[float]
-    ) -> Tuple[List[float], List[float]]:
-        """Second-order motion profiling per joint (vel + acc limits) for smoothness."""
-        VMAX_CMD = VEL_LIMIT_RAD_S
-        ACC = ACC_LIMIT_RAD_S2
-
-        if prev_y is None:
-            prev_y = list(target)
-        if prev_v is None:
-            prev_v = [0.0] * len(target)
-
-        y_new: List[float] = []
-        v_new: List[float] = []
-
-        for j, qt in enumerate(target):
-            yj = prev_y[j]
-            vj = prev_v[j]
-
-            # Desired velocity to reach target
-            v_des = (qt - yj) / DT
-
-            # Apply acceleration limit
-            dv = max(-ACC * DT, min(ACC * DT, v_des - vj))
-            vj = vj + dv
-
-            # Apply velocity limit
-            if vj > VMAX_CMD:
-                vj = VMAX_CMD
-            if vj < -VMAX_CMD:
-                vj = -VMAX_CMD
-
-            # Update position
-            yj = yj + vj * DT
-
-            y_new.append(yj)
-            v_new.append(vj)
-
-        return y_new, v_new
+                print("   ✗ RIGHT arm: Failed to read positions")
 
     def start(self) -> None:
-        if self._th and self._th.is_alive():
+        if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._th = threading.Thread(target=self._run, daemon=True, name="follow125")
-        self._th.start()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="follow125")
+        self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
-        if self._th:
-            self._th.join(timeout=1.0)
-        # gentle stop on URs
-        for pair in (self.left, self.right):
-            if pair and pair[1].ctrl:
-                try:
-                    pair[1].ctrl.stopJ(AMAX)
-                except Exception:
-                    pass
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        # Stop robots
+        if self.left_robot:
+            self.left_robot.ur.stop_j(self.config.amax)
+        if self.right_robot:
+            self.right_robot.ur.stop_j(self.config.amax)
 
-    def _ensure_ur_ready(self, ur: URSide) -> bool:
-        """Ensure UR is ready for control - fast and simple."""
-        ur.ensure_receive()
-        if not ur.ensure_control():
-            print(f"[follow] {ur.host}: RTDE control not available")
+    def _ensure_ur_ready(self, robot: URDynamixelRobot) -> bool:
+        """Ensure UR is ready for control."""
+        if not robot.ur.ensure_control():
+            print(f"[follow] {robot.ur.host}: RTDE control not available")
             return False
-        if ur.ctrl:
-            ur.end_teach()
-            return True
-        return False
+        return True
 
     def _run(self) -> None:
         # Try to bump process niceness (Linux); ignore if not permitted
@@ -932,396 +748,234 @@ class FollowThread:
 
         # Prepare URs first; don't start loop if neither is ready
         ready_any = False
-        for pair in (self.left, self.right):
-            if pair and self._ensure_ur_ready(pair[1]):
-                ready_any = True
+        if self.left_robot and self._ensure_ur_ready(self.left_robot):
+            ready_any = True
+        if self.right_robot and self._ensure_ur_ready(self.right_robot):
+            ready_any = True
 
         if not ready_any:
             print("[follow] No UR control available; not starting streaming")
             return
 
-        error_count = {"left": 0, "right": 0}
-        max_errors = 2  # Stop quickly for safety if control is lost
-
-        # Fixed-rate scheduler using perf_counter
-        import time as _t
-
-        next_t = _t.perf_counter()
+        # Start scheduler
+        self.scheduler.start()
+        loop_count = 0
 
         while not self._stop.is_set():
-            # LEFT side with relative + smooth control
-            if self.left:
-                busL, urL = self.left
-                qL = busL.read_present_positions()
-                if qL and urL.ctrl:
-                    # Baseline lazy-init if user didn't press center-first
-                    if self.q0_dxl_L is None or self.q0_ur_L is None:
-                        self.q0_dxl_L = list(qL)
-                        qs = _safe_get_q(urL)
-                        if qs:
-                            self.q0_ur_L = list(qs)
-                        else:
-                            self.q0_ur_L = [0.0] * len(qL)  # Fallback
-                        self.t0_L = time.monotonic()
+            # LEFT robot control
+            if self.left_robot and self.left_controller:
+                dxl_pos = self.left_robot.dxl.read_positions()
+                ur_pos = self.left_robot.ur.get_joint_positions()
 
-                    # --- motion detection for LEFT ---
-                    now = time.monotonic()
-                    moved = False
-                    if self.last_qL is not None:
-                        # max per-joint absolute change since last cycle
-                        max_step = max(abs(a - b) for a, b in zip(qL, self.last_qL))
-                        if max_step > 0.0025:  # More sensitive motion detection
-                            self.last_move_ts_L = now
-                            moved = True
-                    self.last_qL = list(qL)
+                if dxl_pos is not None and ur_pos is not None:
+                    # Auto-initialize baselines on first run if needed
+                    if self.left_controller._baseline_dxl is None:
+                        self.left_controller.set_baselines(dxl_pos[:6], ur_pos)
 
-                    # Inactivity re-baseline to dissolve stuck offsets
-                    if not moved and (now - self.last_move_ts_L) > INACTIVITY_REBASE_S:
-                        # pull DXL baseline a bit toward current reading
-                        self.q0_dxl_L = [
-                            (1.0 - REBASE_BETA) * q0 + REBASE_BETA * q
-                            for q0, q in zip(self.q0_dxl_L, qL)
-                        ]
+                    # Update controller and get target positions
+                    target, is_moving = self.left_controller.update(dxl_pos[:6], ur_pos)
 
-                    # Calculate relative delta from baseline
-                    dq = [ql - q0 for ql, q0 in zip(qL, self.q0_dxl_L)]
-                    dq = self._apply_deadband_scale(dq)
-
-                    # Absolute target = UR baseline + relative delta
-                    q_target = [q0u + d for q0u, d in zip(self.q0_ur_L, dq)]
-
-                    # Optional clamp
-                    q_target = self._clamp_about(self.q0_ur_L, q_target)
-
-                    # Snap tiny commands to baseline to avoid slow creep
-                    q_target = [
-                        q0u if abs(qt - q0u) < SNAP_EPS_RAD else qt
-                        for q0u, qt in zip(self.q0_ur_L, q_target)
-                    ]
-
-                    # Mild bias (assist) toward baseline when near still
-                    q_target = [
-                        qt + ASSIST_K * (q0u - qt) for q0u, qt in zip(self.q0_ur_L, q_target)
-                    ]
-
-                    # Velocity limit of the **command** to prevent runaway spikes
-                    if self.y_L is not None:
-                        max_step = VEL_LIMIT_RAD_S * DT
-                        q_target = [
-                            y + max(-max_step, min(max_step, qt - y))
-                            for y, qt in zip(self.y_L, q_target)
-                        ]
-
-                    # Softstart
-                    s = self._soft_ramp(self.t0_L)
-                    q_target = [q0u + s * (qt - q0u) for q0u, qt in zip(self.q0_ur_L, q_target)]
-
-                    # Jerk-limited motion profile (smooth + fast)
-                    self.y_L, self.v_L = self._profile(self.y_L, self.v_L, q_target)
-
+                    # Send servoJ command
                     try:
-                        # Only send first 6 joints to UR (exclude gripper)
-                        ur_joints = self.y_L[:6] if len(self.y_L) > 6 else self.y_L
-                        urL.ctrl.servoJ(ur_joints, VMAX, AMAX, DT, LOOKAHEAD, GAIN)
-                        error_count["left"] = 0  # Reset error count on success
+                        success = self.left_robot.ur.servo_j(
+                            target,
+                            self.config.vmax,
+                            self.config.amax,
+                            self.config.dt,
+                            self.config.lookahead,
+                            self.config.gain,
+                        )
+                        if success:
+                            self.error_count["left"] = 0
+                        else:
+                            raise RuntimeError("servoJ failed")
                     except Exception as e:
-                        msg = str(e).lower()
-                        if "control script is not running" in msg:
-                            error_count["left"] += 1
-                            if error_count["left"] == 1:
-                                print("\n⚠️  LEFT UR: control script not running")
-                                print(
-                                    "     Please ensure ExternalControl.urp is PLAYING on pendant"
-                                )
-                            # Stop after max attempts
-                            if error_count["left"] >= max_errors:
-                                print("   Too many errors - stopping teleop for safety")
-                                self._stop.set()
-                                return
-                        else:
-                            print(f"[follow] L servoJ error: {e}")
+                        self.error_count["left"] += 1
+                        if self.error_count["left"] == 1:
+                            print(f"\n⚠️  LEFT UR: Control error - {e}")
+                            print("     Ensure ExternalControl.urp is PLAYING")
+                        if self.error_count["left"] >= self.max_errors:
+                            print("   Too many errors - stopping for safety")
+                            self._stop.set()
+                            return
 
-            # RIGHT side with relative + smooth control
-            if self.right:
-                busR, urR = self.right
-                qR = busR.read_present_positions()
-                if qR and urR.ctrl:
-                    # Baseline lazy-init if user didn't press center-first
-                    if self.q0_dxl_R is None or self.q0_ur_R is None:
-                        self.q0_dxl_R = list(qR)
-                        qs = _safe_get_q(urR)
-                        if qs:
-                            self.q0_ur_R = list(qs)
-                        else:
-                            self.q0_ur_R = [0.0] * len(qR)  # Fallback
-                        self.t0_R = time.monotonic()
+            # RIGHT robot control
+            if self.right_robot and self.right_controller:
+                dxl_pos = self.right_robot.dxl.read_positions()
+                ur_pos = self.right_robot.ur.get_joint_positions()
 
-                    # --- motion detection for RIGHT ---
-                    now = time.monotonic()
-                    moved = False
-                    if self.last_qR is not None:
-                        # max per-joint absolute change since last cycle
-                        max_step = max(abs(a - b) for a, b in zip(qR, self.last_qR))
-                        if max_step > 0.0025:  # More sensitive motion detection
-                            self.last_move_ts_R = now
-                            moved = True
-                    self.last_qR = list(qR)
+                if dxl_pos is not None and ur_pos is not None:
+                    # Auto-initialize baselines on first run if needed
+                    if self.right_controller._baseline_dxl is None:
+                        self.right_controller.set_baselines(dxl_pos[:6], ur_pos)
 
-                    # Inactivity re-baseline to dissolve stuck offsets
-                    if not moved and (now - self.last_move_ts_R) > INACTIVITY_REBASE_S:
-                        # pull DXL baseline a bit toward current reading
-                        self.q0_dxl_R = [
-                            (1.0 - REBASE_BETA) * q0 + REBASE_BETA * q
-                            for q0, q in zip(self.q0_dxl_R, qR)
-                        ]
+                    # Update controller and get target positions
+                    target, is_moving = self.right_controller.update(
+                        dxl_pos[:6], ur_pos
+                    )
 
-                    # Calculate relative delta from baseline
-                    dq = [qr - q0 for qr, q0 in zip(qR, self.q0_dxl_R)]
-                    dq = self._apply_deadband_scale(dq)
-
-                    # Absolute target = UR baseline + relative delta
-                    q_target = [q0u + d for q0u, d in zip(self.q0_ur_R, dq)]
-
-                    # Optional clamp
-                    q_target = self._clamp_about(self.q0_ur_R, q_target)
-
-                    # Snap tiny commands to baseline to avoid slow creep
-                    q_target = [
-                        q0u if abs(qt - q0u) < SNAP_EPS_RAD else qt
-                        for q0u, qt in zip(self.q0_ur_R, q_target)
-                    ]
-
-                    # Mild bias (assist) toward baseline when near still
-                    q_target = [
-                        qt + ASSIST_K * (q0u - qt) for q0u, qt in zip(self.q0_ur_R, q_target)
-                    ]
-
-                    # Velocity limit of the **command** to prevent runaway spikes
-                    if self.y_R is not None:
-                        max_step = VEL_LIMIT_RAD_S * DT
-                        q_target = [
-                            y + max(-max_step, min(max_step, qt - y))
-                            for y, qt in zip(self.y_R, q_target)
-                        ]
-
-                    # Softstart
-                    s = self._soft_ramp(self.t0_R)
-                    q_target = [q0u + s * (qt - q0u) for q0u, qt in zip(self.q0_ur_R, q_target)]
-
-                    # Jerk-limited motion profile (smooth + fast)
-                    self.y_R, self.v_R = self._profile(self.y_R, self.v_R, q_target)
-
+                    # Send servoJ command
                     try:
-                        # Only send first 6 joints to UR (exclude gripper)
-                        ur_joints = self.y_R[:6] if len(self.y_R) > 6 else self.y_R
-                        urR.ctrl.servoJ(ur_joints, VMAX, AMAX, DT, LOOKAHEAD, GAIN)
-                        error_count["right"] = 0  # Reset error count on success
-                    except Exception as e:
-                        msg = str(e).lower()
-                        if "control script is not running" in msg:
-                            error_count["right"] += 1
-                            if error_count["right"] == 1:
-                                print("\n⚠️  RIGHT UR: control script not running")
-                                print(
-                                    "     Please ensure ExternalControl.urp is PLAYING on pendant"
-                                )
-                            # Stop after max attempts
-                            if error_count["right"] >= max_errors:
-                                print("   Too many errors - stopping teleop for safety")
-                                self._stop.set()
-                                return
+                        success = self.right_robot.ur.servo_j(
+                            target,
+                            self.config.vmax,
+                            self.config.amax,
+                            self.config.dt,
+                            self.config.lookahead,
+                            self.config.gain,
+                        )
+                        if success:
+                            self.error_count["right"] = 0
                         else:
-                            print(f"[follow] R servoJ error: {e}")
+                            raise RuntimeError("servoJ failed")
+                    except Exception as e:
+                        self.error_count["right"] += 1
+                        if self.error_count["right"] == 1:
+                            print(f"\n⚠️  RIGHT UR: Control error - {e}")
+                            print("     Ensure ExternalControl.urp is PLAYING")
+                        if self.error_count["right"] >= self.max_errors:
+                            print("   Too many errors - stopping for safety")
+                            self._stop.set()
+                            return
 
-            # Sleep exactly to the next tick (accounts for compute time)
-            next_t += DT
-            now = _t.perf_counter()
-            delay = next_t - now
-            if delay > 0:
-                _t.sleep(delay)
-            else:
-                # Overrun detected
-                over_ms = -delay * 1000
+            # Wait for next tick
+            self.scheduler.wait()
 
-                # Major overrun (>100ms) - likely DXL read delay
-                if over_ms > 100:
-                    # Realign immediately to current time + DT
-                    next_t = now + DT
-
-                    # Only print warning occasionally to avoid spam
-                    if int(now * 4) % 4 == 0:  # ~1 per second
-                        print(f"[loop] Major overrun {over_ms:.1f}ms - realigning")
-
-                        # If consistent major overruns, suggest fixes
-                        if over_ms > 200:
-                            error_count.setdefault("overrun", 0)
-                            error_count["overrun"] += 1
-                            if error_count["overrun"] == 10:
-                                print("\n⚠️  Consistent timing issues detected!")
-                                print("   This may cause jerky motion.")
-                                print("   Possible fixes:")
-                                print("   1. Check DXL servo connections")
-                                print("   2. Reduce servo count temporarily")
-                                print("   3. Check USB latency/interference")
-                                print("")
-                else:
-                    # Minor overrun - try to catch up gradually
-                    next_t = now + (DT * 0.5)  # Partial skip to recover
+            # Print timing stats occasionally
+            loop_count += 1
+            if loop_count % 1000 == 0:
+                stats = self.scheduler.get_stats()
+                print(
+                    f"[timing] freq: {stats['mean_freq']:.1f}Hz, "
+                    f"overruns: {stats['overruns']}, "
+                    f"dt: {stats['mean_dt'] * 1000:.1f}±{stats['std_dt'] * 1000:.1f}ms"
+                )
 
 
-def _build_bus(
-    name: str,
-    port: Optional[str],
-    baud: int,
-    ids: List[int],
-    signs: List[int],
-    offsets_deg: List[float],
-) -> Optional[DxlBus]:
-    if not port or not ids:
+def _build_robot(
+    config: Config,
+    side: str,  # "left" or "right"
+) -> Optional[URDynamixelRobot]:
+    """Build a URDynamixelRobot from config."""
+    robot_config = getattr(config, f"{side}_robot", {})
+
+    if not robot_config:
         return None
-    bus = DxlBus(name=name, port=port, baud=baud, ids=ids, signs=signs, offsets_deg=offsets_deg)
-    bus.open()
-    return bus
+
+    ur_host = robot_config.get("ur_host")
+    dxl_port = robot_config.get("dxl_port")
+
+    if not ur_host or not dxl_port:
+        return None
+
+    # Get DXL parameters
+    dxl_ids = robot_config.get("dxl_ids", [])
+    dxl_signs = robot_config.get("dxl_signs", [1] * len(dxl_ids))
+    dxl_offsets = robot_config.get("dxl_offsets_deg", [0.0] * len(dxl_ids))
+
+    # Create robot
+    robot = URDynamixelRobot(
+        ur_host=ur_host,
+        dxl_port=dxl_port,
+        dxl_ids=dxl_ids,
+        dxl_signs=dxl_signs,
+        dxl_offsets_deg=dxl_offsets,
+        dxl_baudrate=config.dynamixel.get("baudrate", 1000000),
+        control_frequency=config.hz,
+    )
+
+    # Connect
+    ur_ok, dxl_ok = robot.connect()
+    print(
+        f"[{side}] UR: {'connected' if ur_ok else 'FAILED'}, DXL: {'connected' if dxl_ok else 'FAILED'}"
+    )
+
+    if not dxl_ok:
+        print(f"[{side}] Failed to connect to Dynamixel servos")
+        robot.disconnect()
+        return None
+
+    return robot
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="DXL→UR servoJ teleop (fast+smooth) + pedals + grippers"
-    )
-    ap.add_argument("--ur-left", type=str, default=None, help="UR IP for LEFT arm")
-    ap.add_argument("--ur-right", type=str, default=None, help="UR IP for RIGHT arm")
-    ap.add_argument(
-        "--left-port", type=str, default=None, help="/dev/serial/by-id/... for LEFT DXL"
+        description="Optimized DXL→UR teleop with GELLO patterns"
     )
     ap.add_argument(
-        "--right-port", type=str, default=None, help="/dev/serial/by-id/... for RIGHT DXL"
+        "-c",
+        "--config",
+        type=str,
+        default="configs/teleop_dual_ur5.yaml",
+        help="Path to YAML configuration file",
     )
+
+    # Legacy command-line arguments (override config if provided)
     ap.add_argument(
-        "--left-ids",
+        "--ur-left",
         type=str,
         default=None,
-        help="Comma IDs for LEFT (e.g., 1,2,3,4,5,6,7 with gripper)",
+        help="UR IP for LEFT arm (overrides config)",
     )
     ap.add_argument(
-        "--right-ids",
+        "--ur-right",
         type=str,
         default=None,
-        help="Comma IDs for RIGHT (e.g., 10,11,12,13,14,15,16 with gripper)",
+        help="UR IP for RIGHT arm (overrides config)",
     )
     ap.add_argument(
-        "--left-signs",
-        type=str,
-        default=None,
-        help="Comma ±1 per joint (default 1,1,-1,1,1,1,1 with gripper)",
+        "--left-port", type=str, default=None, help="LEFT DXL port (overrides config)"
     )
     ap.add_argument(
-        "--right-signs",
-        type=str,
-        default=None,
-        help="Comma ±1 per joint (default 1,1,-1,1,1,1,1 with gripper)",
+        "--right-port", type=str, default=None, help="RIGHT DXL port (overrides config)"
     )
     ap.add_argument(
-        "--left-offsets-deg", type=str, default=None, help="Comma offsets(deg) per joint"
+        "--baud", type=int, default=None, help="DXL baudrate (overrides config)"
+    )
+
+    # Control flags
+    ap.add_argument(
+        "--joints-passive", action="store_true", help="Leave DXL torque OFF"
+    )
+    ap.add_argument("--torque-on", action="store_true", help="Force DXL torque ON")
+    ap.add_argument(
+        "--pedal-debug", action="store_true", help="Print raw pedal packets"
+    )
+    ap.add_argument("--dxl-test", action="store_true", help="Test DXL servos and exit")
+    ap.add_argument(
+        "--no-dashboard", action="store_true", help="Skip UR dashboard commands"
     )
     ap.add_argument(
-        "--right-offsets-deg", type=str, default=None, help="Comma offsets(deg) per joint"
-    )
-    ap.add_argument("--baud", type=int, default=1_000_000)
-    ap.add_argument(
-        "--joints-passive", action="store_true", help="Leave DXL joint chains torque OFF (exo free)"
-    )
-    ap.add_argument(
-        "--torque-on",
-        action="store_true",
-        help="Force torque ON for DXL chains (overrides --joints-passive)",
-    )
-    ap.add_argument(
-        "--pedal-debug",
-        action="store_true",
-        help="Print raw pedal HID packets + decoded buttons",
-    )
-    ap.add_argument(
-        "--dxl-test",
-        action="store_true",
-        help="Test DXL servos and exit (diagnostic mode)",
-    )
-    ap.add_argument(
-        "--ur-left-program",
-        type=str,
-        default="/programs/ExternalControl.urp",
-        help="Path to .urp program on LEFT robot (default: /programs/ExternalControl.urp)",
-    )
-    ap.add_argument(
-        "--ur-right-program",
-        type=str,
-        default="/programs/ExternalControl.urp",
-        help="Path to .urp program on RIGHT robot (default: /programs/ExternalControl.urp)",
-    )
-    ap.add_argument(
-        "--no-dashboard",
-        action="store_true",
-        help="Do not send any UR Dashboard commands (no stop/power/play/load)",
-    )
-    ap.add_argument(
-        "--test-mode",
-        action="store_true",
-        help="Test mode: auto-start teleop after 5 seconds if no pedals",
+        "--test-mode", action="store_true", help="Auto-start without pedals"
     )
 
     args = ap.parse_args(argv)
 
-    # Defaults for signs/offsets: common pattern from your config samples
-    # --- Parse IDs (robust: default if omitted) ---
-    left_ids = _parse_int_csv(args.left_ids) if args.left_ids else []
-    right_ids = _parse_int_csv(args.right_ids) if args.right_ids else []
+    # Load configuration
+    config = load_config(args.config)
 
-    if args.left_port and not left_ids:
-        left_ids = [1, 2, 3, 4, 5, 6, 7]  # Including gripper ID 7
-    if args.right_port and not right_ids:
-        right_ids = [10, 11, 12, 13, 14, 15, 16]  # Including gripper ID 16
+    # Apply command-line overrides
+    if args.ur_left:
+        config.left_robot["ur_host"] = args.ur_left
+    if args.ur_right:
+        config.right_robot["ur_host"] = args.ur_right
+    if args.left_port:
+        config.left_robot["dxl_port"] = args.left_port
+    if args.right_port:
+        config.right_robot["dxl_port"] = args.right_port
+    if args.baud:
+        config.dynamixel["baudrate"] = args.baud
 
-    # Add optional ID override via environment variables for debugging
-    if os.environ.get("LEFT_IDS"):
-        left_ids = _parse_int_csv(os.environ["LEFT_IDS"])
-        print(f"[override] LEFT IDs from env: {left_ids}")
-    if os.environ.get("RIGHT_IDS"):
-        right_ids = _parse_int_csv(os.environ["RIGHT_IDS"])
-        print(f"[override] RIGHT IDs from env: {right_ids}")
+    # Apply flags
+    config.debug["pedal_debug"] = args.pedal_debug
 
-    # Defaults for signs/offsets sized to the IDs we now have
-    default_signs = [1, 1, -1, 1, 1, 1, 1]  # Added 7th for gripper
-    def_signs_L = (default_signs + [1] * 7)[: len(left_ids)] if left_ids else []
-    def_signs_R = (default_signs + [1] * 7)[: len(right_ids)] if right_ids else []
-    def_offs_L = [0.0] * len(left_ids)
-    def_offs_R = [0.0] * len(right_ids)
+    # Build robots
+    print("\nBuilding robot connections...")
+    left_robot = _build_robot(config, "left")
+    right_robot = _build_robot(config, "right")
 
-    left_signs = _parse_signs(args.left_signs, len(left_ids), def_signs_L) if left_ids else []
-    right_signs = _parse_signs(args.right_signs, len(right_ids), def_signs_R) if right_ids else []
-    left_offs = (
-        _parse_offsets_deg(args.left_offsets_deg, len(left_ids), def_offs_L) if left_ids else []
-    )
-    right_offs = (
-        _parse_offsets_deg(args.right_offsets_deg, len(right_ids), def_offs_R) if right_ids else []
-    )
-
-    # Build buses
-    busL = (
-        _build_bus("LEFT", args.left_port, args.baud, left_ids, left_signs, left_offs)
-        if args.left_port
-        else None
-    )
-    busR = (
-        _build_bus("RIGHT", args.right_port, args.baud, right_ids, right_signs, right_offs)
-        if args.right_port
-        else None
-    )
-
-    # UR
-    urL = URSide(args.ur_left) if args.ur_left else None
-    urR = URSide(args.ur_right) if args.ur_right else None
-
-    if not (busL or busR):
-        print("[exit] No DXL buses configured; provide --left-port/--right-port and IDs")
+    if not (left_robot or right_robot):
+        print("[exit] No robots configured - check config file")
         return 2
 
     # DXL diagnostic test mode
@@ -1332,146 +986,122 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         test_passed = False
 
-        if busL:
-            print(f"\n[TEST] LEFT arm - Port: {args.left_port}")
-            print(f"       IDs to test: {left_ids}")
-            print(f"       Baud rate: {args.baud}")
+        if left_robot:
+            print("\n[TEST] LEFT arm")
+            print(f"       Port: {config.left_robot.get('dxl_port')}")
+            print(f"       IDs: {config.left_robot.get('dxl_ids')}")
+            print(f"       Baud: {config.dynamixel.get('baudrate')}")
 
-            # Try reading multiple times
+            # Test read
             for attempt in range(3):
-                positions = busL.read_present_positions()
-                if positions:
+                positions = left_robot.dxl.read_positions()
+                if positions is not None:
                     print("       ✓ SUCCESS! Positions:")
-                    for id_val, pos in zip(left_ids, positions):
-                        print(f"         ID {id_val}: {pos:.3f} rad ({math.degrees(pos):.1f}°)")
+                    for i, pos in enumerate(positions):
+                        print(
+                            f"         Joint {i}: {pos:.3f} rad ({np.degrees(pos):.1f}°)"
+                        )
                     test_passed = True
                     break
                 else:
                     print(f"       Attempt {attempt + 1}/3: No response")
                     time.sleep(0.5)
 
-            if not positions:
-                print("       ✗ FAILED - No response from servos after 3 attempts")
-                print("\n       Troubleshooting:")
-                print("       1. Check servo power (5V for XL330, LEDs should be on)")
-                print("       2. Try different baud rate:")
-                print(f"          Currently using: {args.baud}")
-                print(f"          Try: --baud {1000000 if args.baud == 57600 else 57600}")
-                print("       3. Verify USB connection: ls -la /dev/serial/by-id/")
-                print("       4. Check servo IDs (default: 1-7)")
-                print("       5. Test single servo: LEFT_IDS=1")
-                print("       6. Check wiring: Data+ and Data- connections")
+        if right_robot:
+            print("\n[TEST] RIGHT arm")
+            print(f"       Port: {config.right_robot.get('dxl_port')}")
+            print(f"       IDs: {config.right_robot.get('dxl_ids')}")
+            print(f"       Baud: {config.dynamixel.get('baudrate')}")
 
-        if busR:
-            print(f"\n[TEST] RIGHT arm - Port: {args.right_port}")
-            print(f"       IDs to test: {right_ids}")
-            print(f"       Baud rate: {args.baud}")
-
-            # Try reading multiple times
+            # Test read
             for attempt in range(3):
-                positions = busR.read_present_positions()
-                if positions:
+                positions = right_robot.dxl.read_positions()
+                if positions is not None:
                     print("       ✓ SUCCESS! Positions:")
-                    for id_val, pos in zip(right_ids, positions):
-                        print(f"         ID {id_val}: {pos:.3f} rad ({math.degrees(pos):.1f}°)")
+                    for i, pos in enumerate(positions):
+                        print(
+                            f"         Joint {i}: {pos:.3f} rad ({np.degrees(pos):.1f}°)"
+                        )
                     test_passed = True
                     break
                 else:
                     print(f"       Attempt {attempt + 1}/3: No response")
                     time.sleep(0.5)
-
-            if not positions:
-                print("       ✗ FAILED - No response from servos after 3 attempts")
-                print("\n       Troubleshooting:")
-                print("       1. Check servo power (5V for XL330, LEDs should be on)")
-                print("       2. Try different baud rate:")
-                print(f"          Currently using: {args.baud}")
-                print(f"          Try: --baud {1000000 if args.baud == 57600 else 57600}")
-                print("       3. Verify USB connection: ls -la /dev/serial/by-id/")
-                print("       4. Check servo IDs (default: 10-16)")
-                print("       5. Test single servo: RIGHT_IDS=10")
-                print("       6. Check wiring: Data+ and Data- connections")
 
         print("\n" + "=" * 60)
         if test_passed:
-            print("✓ At least some servos are responding")
-            print("  You can proceed with teleop")
+            print("✓ Servos are responding")
         else:
-            print("✗ No servos responding - fix hardware issues first")
+            print("✗ No servos responding")
         print("=" * 60)
 
-        if busL:
-            busL.close()
-        if busR:
-            busR.close()
+        # Cleanup
+        if left_robot:
+            left_robot.disconnect()
+        if right_robot:
+            right_robot.disconnect()
         return 0
-
-    if not (urL or urR):
-        print("[exit] No UR IPs provided; use --ur-left/--ur-right")
-        return 2
 
     # Print startup diagnostics
     print("\n" + "=" * 60)
     print("TELEOP STARTUP DIAGNOSTICS")
     print("=" * 60)
-    print(f"Speed Limits: VMAX={VMAX:.2f} rad/s, AMAX={AMAX:.1f} rad/s²")
-    if VMAX < 0.1:
+    print(f"Config: {args.config}")
+    print(f"Speed: VMAX={config.vmax:.2f} rad/s, AMAX={config.amax:.1f} rad/s²")
+    if config.vmax < 0.1:
         print("  → SAFE MODE: Very slow for testing")
-    elif VMAX < 0.5:
+    elif config.vmax < 0.5:
         print("  → GENTLE MODE: Good for initial testing")
     else:
         print("  → NORMAL MODE: Full speed operation")
 
-    print("\nDXL Configuration:")
-    if busL:
-        print(f"  LEFT:  {args.left_port}")
-        print(f"         IDs: {left_ids}, Baud: {args.baud}")
-    if busR:
-        print(f"  RIGHT: {args.right_port}")
-        print(f"         IDs: {right_ids}, Baud: {args.baud}")
+    print("\nRobots:")
+    if left_robot:
+        print(
+            f"  LEFT:  {config.left_robot['ur_host']} + {config.left_robot['dxl_port']}"
+        )
+    if right_robot:
+        print(
+            f"  RIGHT: {config.right_robot['ur_host']} + {config.right_robot['dxl_port']}"
+        )
 
-    print("\nUR Configuration:")
-    if urL:
-        print(f"  LEFT:  {args.ur_left} → {args.ur_left_program}")
-    if urR:
-        print(f"  RIGHT: {args.ur_right} → {args.ur_right_program}")
-
-    print("\nControl Mode:")
-    print(f"  Joints: {'PASSIVE (torque OFF)' if args.joints_passive else 'ACTIVE (torque ON)'}")
+    print("\nControl:")
+    print(f"  Rate: {config.hz} Hz")
+    print(f"  Joints: {'PASSIVE' if args.joints_passive else 'ACTIVE'}")
     print(f"  Dashboard: {'DISABLED' if args.no_dashboard else 'ENABLED'}")
     print("=" * 60 + "\n")
 
     try:
-        # Optional torque setup (default passive)
+        # Set DXL torque mode
         if args.torque_on and not args.joints_passive:
-            if busL:
-                busL.torque(True)
-            if busR:
-                busR.torque(True)
+            if left_robot:
+                left_robot.set_dxl_torque(True)
+            if right_robot:
+                right_robot.set_dxl_torque(True)
+            print("[dxl] Torque ON")
         else:
-            print("[dxl] joints-passive: leaving joint chains torque OFF")
+            print("[dxl] Torque OFF (passive mode)")
 
-        # Prepare UR control/receive and nudge robots toward READY
-        for side, ur in [("LEFT", urL), ("RIGHT", urR)]:
-            if ur:
-                ur.ensure_receive()
-                print(f"[init] Preparing UR {side} at {ur.host}...")
-                if not args.no_dashboard:
-                    # Only send dashboard commands if allowed
-                    _dashboard_play(ur.host)
-                else:
-                    print(f"[dash] {ur.host}: Skipping dashboard commands (--no-dashboard)")
+        # Prepare UR robots
+        if not args.no_dashboard:
+            for robot, side in [(left_robot, "LEFT"), (right_robot, "RIGHT")]:
+                if robot:
+                    print(f"[init] Preparing {side} UR at {robot.ur.host}...")
+                    _dashboard_play(robot.ur.host)
 
+        # Create follow thread
         ft = FollowThread(
-            left=(busL, urL) if (busL and urL) else None,
-            right=(busR, urR) if (busR and urR) else None,
-            left_prog=args.ur_left_program,
-            right_prog=args.ur_right_program,
+            left_robot=left_robot,
+            right_robot=right_robot,
+            config=config,
         )
-        ft.no_dashboard = args.no_dashboard  # Pass flag to thread
 
         # Set up pedal monitoring
-        pedal_monitor = PedalMonitor(debug=args.pedal_debug)
+        pedal_monitor = PedalMonitor(
+            vendor_id=config.pedal.get("vendor_id", 0x0FD9),
+            product_id=config.pedal.get("product_id", 0x0086),
+            debug=config.debug.get("pedal_debug", False),
+        )
 
         # Track saved mode for gentle -> full transition
         _saved_mode = None
@@ -1479,190 +1109,106 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Define pedal callbacks
         def on_left_interrupt():
             """INTERRUPT: Stop URs for external program control."""
-            # First stop the follow thread if running
-            if ft._th and ft._th.is_alive():
+            # Stop the follow thread
+            if ft._thread and ft._thread.is_alive():
                 ft.stop()
 
-            # Stop and disconnect both URs cleanly
-            for ur in (urL, urR):
-                if ur:
-                    ur.stop_now()
-                    # Brief pause to ensure stop command is processed
+            # Stop and disconnect robots
+            for robot in (left_robot, right_robot):
+                if robot:
+                    robot.ur.stop_j(config.amax)
                     time.sleep(0.05)
-                    # Disconnect to free up for external control
-                    ur.disconnect()
+                    robot.disconnect()
 
-            # Clear the baselines to force recapture on next use
-            ft.q0_dxl_L = None
-            ft.q0_ur_L = None
-            ft.q0_dxl_R = None
-            ft.q0_ur_R = None
+            # Reset controllers
+            if ft.left_controller:
+                ft.left_controller.reset()
+            if ft.right_controller:
+                ft.right_controller.reset()
 
         def on_center_first():
             """PREP: capture baselines, gentle mode, no streaming yet."""
             nonlocal _saved_mode
-            _saved_mode = _set_gentle_mode()
+            _saved_mode = _set_gentle_mode(config)
+
             # Capture baselines
-            if ft.left:
-                bus, ur = ft.left
-                # Try multiple times for DXL read
-                for retry in range(3):
-                    ft.q0_dxl_L = bus.read_present_positions()
-                    if ft.q0_dxl_L:
-                        break
-                    time.sleep(0.1)
-                    if retry > 0:
-                        print(f"   Retrying LEFT DXL read... ({retry + 1}/3)")
+            ft.capture_baselines()
 
-                if ur:
-                    ft.q0_ur_L = _safe_get_q(ur)
-                    ft.t0_L = time.monotonic()
-                n_joints = len(ft.q0_dxl_L) if ft.q0_dxl_L else 0
-                expected = len(left_ids)
-                if n_joints > 0:
-                    print(f"   ✓ LEFT arm: {n_joints}/{expected} joints captured")
-                    if n_joints < expected:
-                        print(f"      Warning: Expected {expected} joints, got {n_joints}")
-                else:
-                    print("   ✗ LEFT arm: Failed to read positions - check DXL power/connection")
-                    print("      Quick fixes:")
-                    print("      1. Check servo power (5V for XL330, check LED)")
-                    print("      2. Try --baud 57600 if using 1000000")
-                    print("      3. Test single servo: LEFT_IDS=1")
-                    print("      4. Verify port: ls -la /dev/serial/by-id/")
-
-            if ft.right:
-                bus, ur = ft.right
-                # Try multiple times for DXL read
-                for retry in range(3):
-                    ft.q0_dxl_R = bus.read_present_positions()
-                    if ft.q0_dxl_R:
-                        break
-                    time.sleep(0.1)
-                    if retry > 0:
-                        print(f"   Retrying RIGHT DXL read... ({retry + 1}/3)")
-
-                if ur:
-                    ft.q0_ur_R = _safe_get_q(ur)
-                    ft.t0_R = time.monotonic()
-                n_joints = len(ft.q0_dxl_R) if ft.q0_dxl_R else 0
-                expected = len(right_ids)
-                if n_joints > 0:
-                    print(f"   ✓ RIGHT arm: {n_joints}/{expected} joints captured")
-                    if n_joints < expected:
-                        print(f"      Warning: Expected {expected} joints, got {n_joints}")
-                else:
-                    print("   ✗ RIGHT arm: Failed to read positions - check DXL power/connection")
-                    print("      Quick fixes:")
-                    print("      1. Check servo power (5V for XL330, check LED)")
-                    print("      2. Try --baud 57600 if using 1000000")
-                    print("      3. Test single servo: RIGHT_IDS=10")
-                    print("      4. Verify port: ls -la /dev/serial/by-id/")
+            # Reconnect URs if needed
+            for robot in (left_robot, right_robot):
+                if robot:
+                    robot.ur.ensure_control()
 
         def on_center_second():
             """START: restore full params and begin streaming."""
             nonlocal _saved_mode
             if _saved_mode is not None:
-                _restore_mode(_saved_mode)
+                _restore_mode(config, _saved_mode)
                 _saved_mode = None
 
-            # Quick check that we have DXL data
+            # Quick DXL check
             dxl_ok = False
-            if ft.q0_dxl_L and len(ft.q0_dxl_L) > 0:
+            if left_robot and left_robot.dxl.read_positions() is not None:
                 dxl_ok = True
-                print(f"   ✓ LEFT DXL: {len(ft.q0_dxl_L)} joints ready")
-            if ft.q0_dxl_R and len(ft.q0_dxl_R) > 0:
+                print("   ✓ LEFT DXL ready")
+            if right_robot and right_robot.dxl.read_positions() is not None:
                 dxl_ok = True
-                print(f"   ✓ RIGHT DXL: {len(ft.q0_dxl_R)} joints ready")
+                print("   ✓ RIGHT DXL ready")
 
             if not dxl_ok:
                 print("\n⚠️  ERROR: No DXL servos responding!")
-                print("   Cannot start teleop without servo feedback.")
-                print("   ")
-                print("   SOLUTION:")
-                print("   1. Check servo power (5V supply, LEDs should be on)")
-                print("   2. Try different baud rate:")
-                print("      --baud 1000000 (default for new servos)")
-                print("      --baud 57600 (common alternative)")
-                print("   3. Check USB connections and ports")
-                print("   4. Test with single servo: LEFT_IDS=1 or RIGHT_IDS=10")
+                print("   Check servo power and connections")
                 return
 
             print("\n✅ Starting teleoperation!")
             ft.start()
 
         def on_right_stop():
-            """STOP: Sequential shutdown - stop teleop, clear connections, return to autonomous mode."""
-            print("   🔄 Starting sequential shutdown...")
+            """STOP: Clean shutdown and return to idle."""
+            print("   🔄 Starting shutdown...")
 
-            # Step 1: Stop the streaming thread first
-            print("   [1/5] Stopping teleop streaming...")
+            # Stop teleop thread
+            print("   [1/4] Stopping teleop...")
             ft.stop()
-            time.sleep(0.1)  # Allow thread to fully stop
+            time.sleep(0.1)
 
-            # Step 2: Immediately disconnect RTDE control interfaces
-            print("   [2/5] Disconnecting RTDE control interfaces...")
-            for ur in (urL, urR):
-                if ur and ur.ctrl:
-                    try:
-                        ur.ctrl.stopJ(AMAX)  # Stop any motion
-                        ur.ctrl.disconnect()  # Disconnect cleanly
-                        ur.ctrl = None  # Clear the reference
-                        print(f"        ✓ {ur.host} control disconnected")
-                    except Exception as e:
-                        print(f"        ⚠️ {ur.host} disconnect error: {e}")
-                        ur.ctrl = None
+            # Disconnect robots
+            print("   [2/4] Disconnecting robots...")
+            for robot in (left_robot, right_robot):
+                if robot:
+                    robot.disconnect()
 
-            # Step 3: Clear RTDE receive interfaces
-            print("   [3/5] Clearing RTDE receive interfaces...")
-            for ur in (urL, urR):
-                if ur and ur.rcv:
-                    try:
-                        ur.rcv.disconnect()
-                        ur.rcv = None
-                        print(f"        ✓ {ur.host} receive disconnected")
-                    except Exception:
-                        ur.rcv = None
+            # Set DXL to passive
+            print("   [3/4] Setting servos to passive...")
+            for robot in (left_robot, right_robot):
+                if robot:
+                    robot.set_dxl_torque(False)
 
-            # Step 4: Return DXL to passive mode
-            print("   [4/5] Setting GELLO arms to passive...")
-            for bus in (busL, busR):
-                if bus:
-                    bus.torque(False)
-
-            # Step 5: Clear any lingering connections and return to autonomous mode
-            print("   [5/5] Returning control to autonomous mode...")
+            # Clear connections
+            print("   [4/4] Clearing connections...")
             robot_hosts = []
-            if urL:
-                robot_hosts.append(urL.host)
-            if urR:
-                robot_hosts.append(urR.host)
+            if left_robot:
+                robot_hosts.append(left_robot.ur.host)
+            if right_robot:
+                robot_hosts.append(right_robot.ur.host)
 
-            # Extra connection clearing step
             if robot_hosts:
-                time.sleep(0.2)  # Brief pause before clearing
-                success = clear_robots_quietly(robot_hosts)
-                if not success:
-                    print("        ⚠️ Some connections may need manual clearing")
+                clear_robots_quietly(robot_hosts)
 
-            # Prepare robots for autonomous control
-            if robot_hosts:
-                for ur_host in robot_hosts:
-                    if _prepare_for_autonomous(ur_host, args.no_dashboard):
-                        print(f"        ✓ {ur_host} ready for autonomous control")
-                    else:
-                        print(f"        ⚠️ {ur_host} may need manual intervention")
-
-            # Reset state machine to IDLE
+            # Reset state
             pedal_monitor.state = TeleopState.IDLE
-
-            print("   ✅ Shutdown complete - ready for autonomous operation")
+            print("   ✅ Shutdown complete")
 
         # Assign callbacks
         pedal_monitor.cb_left = on_left_interrupt
         pedal_monitor.cb_center_1 = on_center_first
         pedal_monitor.cb_center_2 = on_center_second
         pedal_monitor.cb_right = on_right_stop
+
+        # Update button mapping from config
+        pedal_monitor.PEDAL_LEFT = config.pedal_left
+        pedal_monitor.PEDAL_CENTER = config.pedal_center
+        pedal_monitor.PEDAL_RIGHT = config.pedal_right
 
         # Start pedal monitoring
         pedal_connected = pedal_monitor.connect()
@@ -1676,8 +1222,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("   🟡 CENTER → Tap 1: Prepare | Tap 2: Start teleop")
             print("   ⏹️  RIGHT  → Stop teleop (return to idle)\n")
             print("⚙️  Settings:")
-            print(f"   Speed: VMAX={VMAX:.2f} rad/s, AMAX={AMAX:.1f} rad/s²")
-            print(f"   Mode: {'Gentle' if VMAX < 0.5 else 'Normal' if VMAX < 1.0 else 'Fast'}")
+            print(
+                f"   Speed: VMAX={config.vmax:.2f} rad/s, AMAX={config.amax:.1f} rad/s²"
+            )
+            print(
+                f"   Mode: {'Gentle' if config.vmax < 0.5 else 'Normal' if config.vmax < 1.0 else 'Fast'}"
+            )
             print("   Safety: Wrist clamped, deadbands active\n")
             print("Ready for pedal input... (Ctrl+C to exit)\n")
         else:
@@ -1685,32 +1235,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             if args.test_mode:
                 print("\n" + "=" * 60)
-                print("TEST MODE ACTIVE - NO PEDALS")
+                print("TEST MODE - AUTO START")
                 print("=" * 60)
-                print("\n⚠️  AUTO-START SEQUENCE:")
-                print("   Will automatically start teleop in 5 seconds...")
-                print("   This allows testing without pedals")
-                print("   Press Ctrl+C to cancel\n")
 
                 # Countdown
-                for i in range(5, 0, -1):
+                for i in range(3, 0, -1):
                     print(f"   Starting in {i}...")
                     time.sleep(1.0)
 
-                print("\n🚀 Starting automatic test sequence...")
+                print("\n🚀 Auto-starting teleop...")
 
-                # Simulate CENTER pedal first tap (capture baselines)
-                print("\n[TEST] Step 1: Capturing baselines...")
+                # Auto sequence
+                print("\n[1/2] Capturing baselines...")
                 on_center_first()
-                time.sleep(2.0)
+                time.sleep(1.0)
 
-                # Simulate CENTER pedal second tap (start teleop)
-                print("\n[TEST] Step 2: Starting teleop...")
+                print("\n[2/2] Starting teleop...")
                 on_center_second()
 
-                print("\n[TEST] Teleop should now be running!")
-                print("       Move GELLO arms to control UR robots")
-                print("       Press Ctrl+C to stop\n")
+                print("\n✅ Teleop running!")
+                print("   Move GELLO arms to control robots")
+                print("   Press Ctrl+C to stop\n")
             else:
                 print("\nPedal troubleshooting:")
                 print("  1. Check USB: lsusb | grep 0fd9")
@@ -1720,7 +1265,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(
                     '     echo \'SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", MODE="0666"\' | sudo tee /etc/udev/rules.d/99-streamdeck.rules'
                 )
-                print("     sudo udevadm control --reload-rules && sudo udevadm trigger")
+                print(
+                    "     sudo udevadm control --reload-rules && sudo udevadm trigger"
+                )
                 print("  4. Unplug and replug the pedal")
                 print("\nOR use --test-mode to auto-start without pedals:")
                 print("  Add --test-mode to your command to test teleop without pedals")
@@ -1731,23 +1278,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             while True:
                 time.sleep(0.1)
         except KeyboardInterrupt:
-            print("\n[exit] Shutting down...")
+            print("\n[exit] User interrupted")
             ft.stop()
-            if pedal_monitor.device:
-                pedal_monitor.stop_monitoring()
 
     finally:
-        # Clean down DXL
-        if busL:
-            busL.close()
-        if busR:
-            busR.close()
+        # Cleanup
+        print("\n[cleanup] Shutting down...")
 
-        # Properly disconnect UR connections using the new method
-        if urL:
-            urL.disconnect()
-        if urR:
-            urR.disconnect()
+        # Stop pedal monitoring
+        if pedal_monitor and pedal_monitor.device:
+            pedal_monitor.stop_monitoring()
+
+        # Disconnect robots
+        if left_robot:
+            left_robot.disconnect()
+        if right_robot:
+            right_robot.disconnect()
+
+        print("[cleanup] Done")
 
     return 0
 

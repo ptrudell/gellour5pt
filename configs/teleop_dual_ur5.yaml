@@ -1,0 +1,94 @@
+# Teleop configuration for dual UR5 robots with Dynamixel servos
+# Based on GELLO software patterns
+
+# Robot configuration
+left_robot:
+  ur_host: "192.168.1.211"
+  ur_program: "/programs/ExternalControl.urp"
+  dxl_port: "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAAMNTI-if00-port0"  # ttyUSB0
+  dxl_ids: [1, 2, 3, 4, 5, 6, 7]  # Including gripper ID 7
+  dxl_signs: [1, 1, -1, 1, 1, 1, 1]
+  dxl_offsets_deg: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+right_robot:
+  ur_host: "192.168.1.210"
+  ur_program: "/programs/ExternalControl.urp"
+  dxl_port: "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAAMNUF-if00-port0"  # ttyUSB2 - correct port for RIGHT arm
+  dxl_ids: [10, 11, 12, 13, 14, 15, 16]  # Including gripper ID 16
+  dxl_signs: [1, 1, -1, 1, 1, 1, 1]
+  dxl_offsets_deg: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+# Dynamixel configuration
+dynamixel:
+  baudrate: 1000000
+  protocol: 2.0
+  max_retries: 3
+  use_fake_fallback: false
+  torque_on_start: false  # Keep servos passive by default
+
+# Control parameters
+control:
+  hz: 125  # Control frequency
+  dt: 0.008  # 1/125
+  lookahead: 0.15
+  gain: 340
+  velocity_max: 1.4  # rad/s - can be overridden by UR_VMAX env var
+  acceleration_max: 4.0  # rad/s² - can be overridden by UR_AMAX env var
+
+# Motion shaping parameters
+motion_shaping:
+  ema_alpha: 0.12  # Exponential moving average smoothing
+  softstart_time: 0.20  # seconds
+  deadband_deg: [1, 1, 1, 1, 1, 2, 1]  # Per-joint deadbands + gripper
+  scale: [1, 1, 1, 1, 1, 1, 1]  # Per-joint gains + gripper
+  clamp_rad: [null, null, null, null, null, 0.8, null]  # Wrist clamp
+  
+  # Inactivity handling
+  inactivity_rebase_s: 0.3
+  rebase_beta: 0.10
+  snap_epsilon_rad: 0.005
+  
+  # Velocity and acceleration limits
+  vel_limit_rad_s: 6.0
+  acc_limit_rad_s2: 40.0
+  
+  # Assist parameters
+  assist_k: 0.03
+
+# StreamDeck pedal configuration
+pedal:
+  vendor_id: 0x0FD9
+  product_id: 0x0086
+  button_mapping:
+    left: 4  # Interrupt
+    center: 5  # Prep/Start
+    right: 6  # Stop
+  debounce_s: 0.08
+  stabilize_s: 0.018
+  suppress_center_after_left_s: 0.16
+
+# ZMQ communication (for future multi-process architecture)
+zmq:
+  left_robot_port: 6001
+  right_robot_port: 6002
+  host: "127.0.0.1"
+
+# Data collection
+data_collection:
+  enabled: false
+  data_dir: "data/teleop"
+  save_observations: true
+  save_actions: true
+
+# Safety and recovery
+safety:
+  max_control_errors: 2  # Stop after this many consecutive errors
+  dashboard_auto_recover: true
+  clear_connections_on_stop: true
+  prepare_for_autonomous: true
+
+# Debug options
+debug:
+  pedal_debug: false
+  print_timing: true
+  verbose: false
