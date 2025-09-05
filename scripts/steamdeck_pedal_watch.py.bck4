@@ -1,0 +1,927 @@
+#!/usr/bin/env python3
+"""
+DXL→UR joint teleop using servoJ at ~125 Hz (Freedrive OFF).
+With StreamDeck pedal control integration.
+
+Pedal Controls:
+- Left (4): Interrupt current program and start teleop
+- Center (5): First tap sets motors/offsets (gentle), second tap enables full teleop
+- Right (6): Stop teleop and return to normal operation
+
+Key improvements (from the last working chat):
+- Low-latency pedal read loop (ms-level), tunable via env:
+    HID_TIMEOUT_MS (default 5), PEDAL_LOOP_SLEEP (default 0.001)
+- Dashboard preflight: verifies ExternalControl.urp is PLAYING (query-only; no auto-play)
+- Robust ensure_control(): verifies/refreshes RTDE control socket (getJointTemp ping)
+- Inactivity rebase, snap epsilon, mild baseline "assist", wrist clamp
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+import threading
+import time
+import socket
+from enum import Enum
+from typing import Any, List, Optional, Sequence, Tuple
+
+# --- HID imports for pedals ---
+try:
+    import hid  # type: ignore
+except ImportError:
+    print("[warn] python-hidapi not installed, pedal control disabled")
+    hid = None  # type: ignore
+
+# --- UR RTDE imports ---
+try:
+    from rtde_control import RTDEControlInterface  # type: ignore
+    from rtde_receive import RTDEReceiveInterface  # type: ignore
+except Exception:
+    try:
+        from ur_rtde import rtde_control, rtde_receive  # type: ignore
+
+        RTDEControlInterface = rtde_control.RTDEControlInterface
+        RTDEReceiveInterface = rtde_receive.RTDEReceiveInterface
+    except Exception as e:
+        print("[err] Could not import UR RTDE modules:", e)
+        sys.exit(1)
+
+# --- Dynamixel SDK ---
+try:
+    from dynamixel_sdk import COMM_SUCCESS, PacketHandler, PortHandler  # type: ignore
+except Exception as e:
+    print("[err] dynamixel_sdk import failed:", e)
+    sys.exit(1)
+
+# ---------------- Consts ----------------
+PROTO = 2.0
+ADDR_TORQUE_ENABLE = 64
+ADDR_PRESENT_POSITION = 132
+TPR = 4096  # ticks per revolution (XL330/most X-series)
+CENTER = 2048  # neutral ticks
+
+DT = 0.008  # ~125 Hz
+LOOKAHEAD = 0.10
+GAIN = 300
+
+VMAX = float(os.environ.get("UR_VMAX", "0.5"))
+AMAX = float(os.environ.get("UR_AMAX", "1.0"))
+
+# --- Teleop shaping parameters ---
+EMA_ALPHA = 0.20  # 0..1  (higher = more responsive, lower = smoother)
+SOFTSTART_T = 1.0  # seconds to ramp in the command after START
+DEADBAND_DEG = [2, 2, 2, 2, 2, 3]  # per-joint deadband to ignore tiny motions
+SCALE = [1, 1, 1, 1, 1, 1]  # per-joint gain; tweak if any joint feels too sensitive
+# Optional absolute clamps (rad) around the baseline UR pose
+CLAMP_RAD = [None, None, None, None, None, 0.6]  # limit wrist (J6) to ±0.6 rad around baseline
+
+# Inactivity handling to kill residual drift
+INACTIVITY_REBASE_S = 0.4  # if no motion for this long, bleed baseline toward current DXL
+REBASE_BETA = 0.15  # how fast to rebase when inactive (0..1 per inactivity check)
+SNAP_EPS_RAD = 0.01  # if |target - baseline| < this, snap to baseline (no slow creep)
+VEL_LIMIT_RAD_S = 2.0  # limit per-joint change-rate of command (guards numerical spikes)
+
+# Mild assist parameters
+ASSIST_K = 0.05  # 0..1 small; higher pulls harder to baseline
+
+# Pedal button mapping (StreamDeck pedals)
+PEDAL_LEFT = 4  # Interrupt and start teleop
+PEDAL_CENTER = 5  # First tap: motors/offsets, Second tap: enable teleop
+PEDAL_RIGHT = 6  # Stop teleop
+
+# --- Low-latency / dashboard knobs (env-tweakable) ---
+HID_TIMEOUT_MS = int(os.environ.get("HID_TIMEOUT_MS", "5"))           # StreamDeck read timeout (ms)
+PEDAL_LOOP_SLEEP = float(os.environ.get("PEDAL_LOOP_SLEEP", "0.001")) # pedal loop sleep
+DASH_WAIT = float(os.environ.get("DASH_WAIT", "0.06"))                # 60ms between dash cmds
+
+
+# -------------- State Management --------------
+class TeleopState(Enum):
+    IDLE = "idle"
+    MOTORS_SET = "motors_set"  # After first center tap
+    TELEOP_ACTIVE = "teleop_active"  # After second center tap
+
+
+# -------------- Helpers --------------
+
+def _deg_list_to_rad(lst):
+    return [math.radians(x) if x is not None else None for x in lst]
+
+
+DEADBAND_RAD = _deg_list_to_rad(DEADBAND_DEG)
+
+
+def _ticks_to_rad(ticks: int, offset_deg: float, sign: int) -> float:
+    off_ticks = int(round((offset_deg / 360.0) * TPR))
+    return sign * ((ticks - CENTER - off_ticks) * (2 * math.pi / TPR))
+
+
+def _parse_int_csv(s: str) -> List[int]:
+    return [int(x) for x in s.split(",") if x]
+
+
+def _parse_signs(s: Optional[str], n: int, default: Sequence[int]) -> List[int]:
+    if not s:
+        return list(default)
+    vals = [int(x) for x in s.split(",") if x]
+    if len(vals) != n or not all(v in (-1, 1) for v in vals):
+        raise ValueError("--*signs must be comma list of ±1 with length matching IDs")
+    return vals
+
+
+def _parse_offsets_deg(s: Optional[str], n: int, default: Sequence[float]) -> List[float]:
+    if not s:
+        return list(default)
+    vals = [float(x) for x in s.split(",") if x]
+    if len(vals) != n:
+        raise ValueError("--*offsets-deg must match number of IDs")
+    return vals
+
+
+def _safe_get_q(ur: "URSide") -> Optional[List[float]]:
+    """Safely get current joint positions from UR robot."""
+    try:
+        if not ur.rcv:
+            ur.ensure_receive()
+        return list(ur.rcv.getActualQ())
+    except Exception:
+        return None
+
+
+# ---------------- Dashboard helpers (query-only; no auto-play) ----------------
+def _dash_cmd(host: str, cmd: str, timeout: float = 2.0) -> str:
+    """Send a single dashboard command and return response (stripped)."""
+    try:
+        s = socket.create_connection((host, 29999), timeout=timeout)
+        s.recv(4096)  # banner
+        s.send((cmd + "\n").encode())
+        time.sleep(DASH_WAIT)
+        resp = s.recv(4096).decode(errors="ignore").strip()
+        s.close()
+        return resp
+    except Exception as e:
+        return f"<dash-error {e}>"
+
+
+def _check_external_control_playing(host: str) -> bool:
+    """True if ExternalControl.urp is loaded and programState is PLAYING."""
+    loaded = _dash_cmd(host, "get loaded program")
+    state = _dash_cmd(host, "programState")
+    print(f"[dash] {host}: {loaded} | {state}")
+    ok = ("EXTERNAL" in loaded.upper()) and ("PLAYING" in state.upper())
+    if (not ok) and ("freedrive" in loaded.lower()):
+        print(f"[dash] note: freedrive.urp is loaded on {host}")
+    return ok
+
+
+class DxlBus:
+    def __init__(
+        self,
+        name: str,
+        port: str,
+        baud: int,
+        ids: List[int],
+        signs: List[int],
+        offsets_deg: List[float],
+    ):
+        self.name = name
+        self.port = port
+        self.baud = baud
+        self.ids = ids
+        self.signs = signs
+        self.offsets_deg = offsets_deg
+        self.ph: Optional[PortHandler] = None
+        self.pk: Optional[PacketHandler] = None
+
+    def open(self) -> None:
+        self.pk = PacketHandler(PROTO)
+        self.ph = PortHandler(self.port)
+        ok = self.ph.openPort() and self.ph.setBaudRate(self.baud)
+        if not ok:
+            raise RuntimeError(f"open/baud failed for {self.name} @ {self.port} {self.baud}")
+        print(f"[dxl] {self.name}: open {self.port} @ {self.baud}")
+
+    def close(self) -> None:
+        if self.ph:
+            self.ph.closePort()
+            print(f"[dxl] {self.name}: closed")
+
+    def torque(self, on: bool) -> None:
+        if not self.ph or not self.pk:
+            return
+        val = 1 if on else 0
+        for i in self.ids:
+            rc, er = self.pk.write1ByteTxRx(self.ph, i, ADDR_TORQUE_ENABLE, val)
+            if rc != COMM_SUCCESS or er != 0:
+                print(f"[dxl] torque {'ON' if on else 'OFF'} fail id={i} rc={rc} er={er}")
+
+    def read_present_positions(self) -> Optional[List[float]]:
+        if not self.ph or not self.pk:
+            return None
+        out: List[float] = []
+        for j, i in enumerate(self.ids):
+            pos, rc, er = self.pk.read4ByteTxRx(self.ph, i, ADDR_PRESENT_POSITION)
+            if rc != COMM_SUCCESS or er != 0:
+                return None
+            out.append(_ticks_to_rad(int(pos), self.offsets_deg[j], self.signs[j]))
+        return out
+
+
+class URSide:
+    def __init__(self, host: str):
+        self.host = host
+        self.rcv: Optional[Any] = None
+        self.ctrl: Optional[Any] = None
+
+    def ensure_receive(self) -> None:
+        if self.rcv is None:
+            self.rcv = RTDEReceiveInterface(self.host)
+
+    def ensure_control(self, attempts: int = 3, delay_s: float = 0.5) -> bool:
+        if self.ctrl is not None:
+            # verify existing socket is alive
+            try:
+                self.ctrl.getJointTemp()
+                return True
+            except Exception:
+                self.ctrl = None
+        for i in range(max(1, attempts)):
+            try:
+                self.ctrl = RTDEControlInterface(self.host)
+                # quick ping
+                try:
+                    self.ctrl.getJointTemp()
+                except Exception:
+                    pass
+                return True
+            except Exception as e:
+                if "another thread" in str(e).lower():
+                    time.sleep(0.05)
+                else:
+                    time.sleep(delay_s)
+        return False
+
+    def end_teach(self) -> None:
+        try:
+            if self.ctrl:
+                self.ctrl.endTeachMode()
+        except Exception:
+            pass
+
+
+class PedalMonitor:
+    """Monitor StreamDeck pedals for teleop control."""
+
+    def __init__(self, vendor_id: int = 0x0FD9, product_id: int = 0x0086):
+        """Initialize pedal monitor.
+
+        Args:
+            vendor_id: StreamDeck pedal vendor ID
+            product_id: StreamDeck pedal product ID
+        """
+        self.vendor_id = vendor_id
+        self.product_id = product_id
+        self.device: Optional[Any] = None
+        self.state = TeleopState.IDLE
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.last_buttons = set()
+        self.callback_left: Optional[Any] = None
+        self.callback_center_first: Optional[Any] = None
+        self.callback_center_second: Optional[Any] = None
+        self.callback_right: Optional[Any] = None
+
+    def connect(self) -> bool:
+        """Connect to pedal device."""
+        if not hid:
+            return False
+
+        try:
+            self.device = hid.device()
+            self.device.open(self.vendor_id, self.product_id)
+            self.device.set_nonblocking(True)
+            print(
+                f"[pedal] Connected to StreamDeck pedal {self.vendor_id:04x}:{self.product_id:04x}"
+            )
+            return True
+        except Exception as e:
+            print(f"[pedal] Failed to connect: {e}")
+            return False
+
+    def start_monitoring(self) -> None:
+        """Start monitoring thread."""
+        if not self.device:
+            if not self.connect():
+                print("[pedal] Cannot start monitoring without device")
+                return
+
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread.start()
+        print("[pedal] Monitoring started")
+
+    def stop_monitoring(self) -> None:
+        """Stop monitoring thread."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        if self.device:
+            self.device.close()
+            self.device = None
+        print("[pedal] Monitoring stopped")
+
+    def _monitor_loop(self) -> None:
+        """Main monitoring loop."""
+        while not self._stop.is_set():
+            try:
+                data = self.device.read(64, timeout_ms=HID_TIMEOUT_MS)
+                if data:
+                    self._process_buttons(data)
+            except Exception:
+                pass  # Ignore read errors
+            time.sleep(PEDAL_LOOP_SLEEP)
+
+    def _process_buttons(self, data: List[int]) -> None:
+        """Process button presses from HID data."""
+        if len(data) < 5:
+            return
+
+        # Extract button states (StreamDeck pedal format)
+        current_buttons = set()
+        for i in range(3):  # 3 pedals
+            byte_idx = 4 + i // 8
+            bit_idx = i % 8
+            if data[byte_idx] & (1 << bit_idx):
+                current_buttons.add(i + 4)  # Buttons 4, 5, 6
+
+        # Detect new button presses (not held)
+        pressed = current_buttons - self.last_buttons
+
+        for button in pressed:
+            if button == PEDAL_LEFT and self.callback_left:
+                print("[pedal] LEFT pressed - Starting teleop")
+                self.state = TeleopState.IDLE  # Reset state
+                self.callback_left()
+
+            elif button == PEDAL_CENTER:
+                if self.state == TeleopState.IDLE and self.callback_center_first:
+                    print("[pedal] CENTER pressed (1st) - Setting motors/offsets (gentle)")
+                    self.callback_center_first()
+                    self.state = TeleopState.MOTORS_SET
+
+                elif self.state == TeleopState.MOTORS_SET and self.callback_center_second:
+                    print("[pedal] CENTER pressed (2nd) - Enabling full teleop")
+                    self.callback_center_second()
+                    self.state = TeleopState.TELEOP_ACTIVE
+
+            elif button == PEDAL_RIGHT and self.callback_right:
+                print("[pedal] RIGHT pressed - Stopping teleop")
+                self.callback_right()
+                self.state = TeleopState.IDLE
+
+        self.last_buttons = current_buttons
+
+
+class FollowThread:
+    def __init__(
+        self, left: Optional[Tuple[DxlBus, URSide]], right: Optional[Tuple[DxlBus, URSide]]
+    ):
+        self.left = left
+        self.right = right
+        self._stop = threading.Event()
+        self._th: Optional[threading.Thread] = None
+
+        # baselines: DXL (rad) and UR (rad) captured on center-first
+        self.q0_dxl_L: Optional[List[float]] = None
+        self.q0_ur_L: Optional[List[float]] = None
+        self.q0_dxl_R: Optional[List[float]] = None
+        self.q0_ur_R: Optional[List[float]] = None
+
+        # softstart timestamps
+        self.t0_L: Optional[float] = None
+        self.t0_R: Optional[float] = None
+
+        # EMA filtered targets we actually send
+        self.y_L: Optional[List[float]] = None
+        self.y_R: Optional[List[float]] = None
+
+        # inactivity tracking
+        self.last_qL: Optional[List[float]] = None
+        self.last_qR: Optional[List[float]] = None
+        self.last_move_ts_L: float = time.monotonic()
+        self.last_move_ts_R: float = time.monotonic()
+
+    def _apply_deadband_scale(self, dq: List[float]) -> List[float]:
+        """Apply per-joint deadband and scaling."""
+        out = []
+        for j, v in enumerate(dq):
+            db = DEADBAND_RAD[j] if j < len(DEADBAND_RAD) else 0.0
+            if abs(v) < (db or 0.0):
+                out.append(0.0)
+            else:
+                sc = SCALE[j] if j < len(SCALE) else 1.0
+                out.append(v * sc)
+        return out
+
+    def _soft_ramp(self, t0: Optional[float]) -> float:
+        """Calculate soft-start ramp factor (0 to 1)."""
+        if not t0:
+            return 1.0
+        dt = max(0.0, time.monotonic() - t0)
+        return min(1.0, dt / max(1e-6, SOFTSTART_T))
+
+    def _ema(self, prev: Optional[List[float]], target: List[float], alpha: float) -> List[float]:
+        """Exponential moving average filter."""
+        if prev is None:
+            return list(target)
+        return [p + alpha * (t - p) for p, t in zip(prev, target)]
+
+    def _clamp_about(self, base: List[float], q: List[float]) -> List[float]:
+        """Optional absolute clamps around baseline UR pose."""
+        if not CLAMP_RAD or all(c is None for c in CLAMP_RAD):
+            return q
+        out = []
+        for j, val in enumerate(q):
+            c = CLAMP_RAD[j] if j < len(CLAMP_RAD) else None
+            if c is None:
+                out.append(val)
+            else:
+                lo = base[j] - c
+                hi = base[j] + c
+                out.append(min(max(val, lo), hi))
+        return out
+
+    def start(self) -> None:
+        if self._th and self._th.is_alive():
+            return
+        self._stop.clear()
+        self._th = threading.Thread(target=self._run, daemon=True)
+        self._th.start()
+        print("[follow] thread: running at ~125 Hz (servoJ)")
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._th:
+            self._th.join(timeout=1.0)
+        # gentle stop on URs
+        for pair in (self.left, self.right):
+            if pair and pair[1].ctrl:
+                try:
+                    pair[1].ctrl.stopJ(AMAX)
+                except Exception:
+                    pass
+        print("[follow] thread: stopping")
+
+    def _run(self) -> None:
+        # Ensure ExternalControl is PLAYING and RTDE control can be established
+        for pair in (self.left, self.right):
+            if not pair:
+                continue
+            bus, ur = pair
+            ur.ensure_receive()
+            if not _check_external_control_playing(ur.host):
+                print(f"[follow] ERROR: {ur.host} ExternalControl.urp not PLAYING.")
+                print("  → On pendant: Load ExternalControl.urp, set Host IP to your PC, press ▶")
+                return
+            if not ur.ensure_control():
+                print(f"[follow] ERROR: RTDE control unavailable on {ur.host}")
+                print("  → Likely cause: another thread or program is holding control.")
+                return
+            ur.end_teach()
+
+        error_count = {"left": 0, "right": 0}
+        max_errors = 5  # Stop spamming after this many errors
+
+        while not self._stop.is_set():
+            # LEFT side with relative + smooth control
+            if self.left:
+                busL, urL = self.left
+                qL = busL.read_present_positions()
+                if qL and urL.ctrl:
+                    # Baseline lazy-init if user didn't press center-first
+                    if self.q0_dxl_L is None or self.q0_ur_L is None:
+                        self.q0_dxl_L = list(qL)
+                        qs = _safe_get_q(urL)
+                        if qs:
+                            self.q0_ur_L = list(qs)
+                        else:
+                            self.q0_ur_L = [0.0] * len(qL)  # Fallback
+                        self.t0_L = time.monotonic()
+                        print(f"[follow] LEFT: Auto-captured baseline (joints={len(qL)})")
+
+                    # --- motion detection for LEFT ---
+                    now = time.monotonic()
+                    moved = False
+                    if self.last_qL is not None:
+                        # max per-joint absolute change since last cycle
+                        max_step = max(abs(a - b) for a, b in zip(qL, self.last_qL))
+                        if max_step > 0.003:  # ~0.17° step detects human movement
+                            self.last_move_ts_L = now
+                            moved = True
+                    self.last_qL = list(qL)
+
+                    # Inactivity re-baseline to dissolve stuck offsets
+                    if not moved and (now - self.last_move_ts_L) > INACTIVITY_REBASE_S:
+                        # pull DXL baseline a bit toward current reading
+                        self.q0_dxl_L = [
+                            (1.0 - REBASE_BETA) * q0 + REBASE_BETA * q
+                            for q0, q in zip(self.q0_dxl_L, qL)
+                        ]
+
+                    # Calculate relative delta from baseline
+                    dq = [ql - q0 for ql, q0 in zip(qL, self.q0_dxl_L)]
+                    dq = self._apply_deadband_scale(dq)
+
+                    # Absolute target = UR baseline + relative delta
+                    q_target = [q0u + d for q0u, d in zip(self.q0_ur_L, dq)]
+
+                    # Optional clamp
+                    q_target = self._clamp_about(self.q0_ur_L, q_target)
+
+                    # Snap tiny commands to baseline to avoid slow creep
+                    q_target = [
+                        q0u if abs(qt - q0u) < SNAP_EPS_RAD else qt
+                        for q0u, qt in zip(self.q0_ur_L, q_target)
+                    ]
+
+                    # Mild bias (assist) toward baseline when near still
+                    q_target = [
+                        qt + ASSIST_K * (q0u - qt) for q0u, qt in zip(self.q0_ur_L, q_target)
+                    ]
+
+                    # Velocity limit of the **command** to prevent runaway spikes
+                    if self.y_L is not None:
+                        max_step = VEL_LIMIT_RAD_S * DT
+                        q_target = [
+                            y + max(-max_step, min(max_step, qt - y))
+                            for y, qt in zip(self.y_L, q_target)
+                        ]
+
+                    # Softstart + EMA
+                    s = self._soft_ramp(self.t0_L)
+                    q_target = [q0u + s * (qt - q0u) for q0u, qt in zip(self.q0_ur_L, q_target)]
+                    self.y_L = self._ema(self.y_L, q_target, EMA_ALPHA)
+
+                    try:
+                        urL.ctrl.servoJ(self.y_L, VMAX, AMAX, DT, LOOKAHEAD, GAIN)
+                        error_count["left"] = 0  # Reset error count on success
+                    except Exception as e:
+                        error_msg = str(e)
+                        if "control script is not running" in error_msg.lower():
+                            if error_count["left"] < max_errors:
+                                if error_count["left"] == 0:
+                                    print("[follow] LEFT UR: Control script not running!")
+                                    print("  → On pendant: ensure ExternalControl.urp is PLAYING")
+                                error_count["left"] += 1
+                            elif error_count["left"] == max_errors:
+                                print("[follow] LEFT UR: Suppressing further errors...")
+                                error_count["left"] += 1
+                        else:
+                            print(f"[follow] L servoJ error: {e}")
+
+            # RIGHT side with relative + smooth control
+            if self.right:
+                busR, urR = self.right
+                qR = busR.read_present_positions()
+                if qR and urR.ctrl:
+                    # Baseline lazy-init if user didn't press center-first
+                    if self.q0_dxl_R is None or self.q0_ur_R is None:
+                        self.q0_dxl_R = list(qR)
+                        qs = _safe_get_q(urR)
+                        if qs:
+                            self.q0_ur_R = list(qs)
+                        else:
+                            self.q0_ur_R = [0.0] * len(qR)  # Fallback
+                        self.t0_R = time.monotonic()
+                        print(f"[follow] RIGHT: Auto-captured baseline (joints={len(qR)})")
+
+                    # --- motion detection for RIGHT ---
+                    now = time.monotonic()
+                    moved = False
+                    if self.last_qR is not None:
+                        # max per-joint absolute change since last cycle
+                        max_step = max(abs(a - b) for a, b in zip(qR, self.last_qR))
+                        if max_step > 0.003:  # ~0.17° step detects human movement
+                            self.last_move_ts_R = now
+                            moved = True
+                    self.last_qR = list(qR)
+
+                    # Inactivity re-baseline to dissolve stuck offsets
+                    if not moved and (now - self.last_move_ts_R) > INACTIVITY_REBASE_S:
+                        # pull DXL baseline a bit toward current reading
+                        self.q0_dxl_R = [
+                            (1.0 - REBASE_BETA) * q0 + REBASE_BETA * q
+                            for q0, q in zip(self.q0_dxl_R, qR)
+                        ]
+
+                    # Calculate relative delta from baseline
+                    dq = [qr - q0 for qr, q0 in zip(qR, self.q0_dxl_R)]
+                    dq = self._apply_deadband_scale(dq)
+
+                    # Absolute target = UR baseline + relative delta
+                    q_target = [q0u + d for q0u, d in zip(self.q0_ur_R, dq)]
+
+                    # Optional clamp
+                    q_target = self._clamp_about(self.q0_ur_R, q_target)
+
+                    # Snap tiny commands to baseline to avoid slow creep
+                    q_target = [
+                        q0u if abs(qt - q0u) < SNAP_EPS_RAD else qt
+                        for q0u, qt in zip(self.q0_ur_R, q_target)
+                    ]
+
+                    # Mild bias (assist) toward baseline when near still
+                    q_target = [
+                        qt + ASSIST_K * (q0u - qt) for q0u, qt in zip(self.q0_ur_R, q_target)
+                    ]
+
+                    # Velocity limit of the **command** to prevent runaway spikes
+                    if self.y_R is not None:
+                        max_step = VEL_LIMIT_RAD_S * DT
+                        q_target = [
+                            y + max(-max_step, min(max_step, qt - y))
+                            for y, qt in zip(self.y_R, q_target)
+                        ]
+
+                    # Softstart + EMA
+                    s = self._soft_ramp(self.t0_R)
+                    q_target = [q0u + s * (qt - q0u) for q0u, qt in zip(self.q0_ur_R, q_target)]
+                    self.y_R = self._ema(self.y_R, q_target, EMA_ALPHA)
+
+                    try:
+                        urR.ctrl.servoJ(self.y_R, VMAX, AMAX, DT, LOOKAHEAD, GAIN)
+                        error_count["right"] = 0  # Reset error count on success
+                    except Exception as e:
+                        error_msg = str(e)
+                        if "control script is not running" in error_msg.lower():
+                            if error_count["right"] < max_errors:
+                                if error_count["right"] == 0:
+                                    print("[follow] RIGHT UR: Control script not running!")
+                                    print("  → On pendant: ensure ExternalControl.urp is PLAYING")
+                                error_count["right"] += 1
+                            elif error_count["right"] == max_errors:
+                                print("[follow] RIGHT UR: Suppressing further errors...")
+                                error_count["right"] += 1
+                        else:
+                            print(f"[follow] R servoJ error: {e}")
+
+            time.sleep(DT)
+
+
+def _build_bus(
+    name: str,
+    port: Optional[str],
+    baud: int,
+    ids: List[int],
+    signs: List[int],
+    offsets_deg: List[float],
+) -> Optional[DxlBus]:
+    if not port or not ids:
+        return None
+    bus = DxlBus(name=name, port=port, baud=baud, ids=ids, signs=signs, offsets_deg=offsets_deg)
+    bus.open()
+    return bus
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="DXL→UR servoJ teleop (standalone)")
+    ap.add_argument("--ur-left", type=str, default=None, help="UR IP for LEFT arm")
+    ap.add_argument("--ur-right", type=str, default=None, help="UR IP for RIGHT arm")
+    ap.add_argument(
+        "--left-port", type=str, default=None, help="/dev/serial/by-id/... for LEFT DXL"
+    )
+    ap.add_argument(
+        "--right-port", type=str, default=None, help="/dev/serial/by-id/... for RIGHT DXL"
+    )
+    ap.add_argument(
+        "--left-ids", type=str, default=None, help="Comma IDs for LEFT (e.g., 1,2,3,4,5,6)"
+    )
+    ap.add_argument(
+        "--right-ids", type=str, default=None, help="Comma IDs for RIGHT (e.g., 10,11,12,13,14,15)"
+    )
+    ap.add_argument(
+        "--left-signs", type=str, default=None, help="Comma ±1 per joint (default 1,1,-1,1,1,1)"
+    )
+    ap.add_argument(
+        "--right-signs", type=str, default=None, help="Comma ±1 per joint (default 1,1,-1,1,1,1)"
+    )
+    ap.add_argument(
+        "--left-offsets-deg", type=str, default=None, help="Comma offsets(deg) per joint"
+    )
+    ap.add_argument(
+        "--right-offsets-deg", type=str, default=None, help="Comma offsets(deg) per joint"
+    )
+    ap.add_argument("--baud", type=int, default=1_000_000)
+    ap.add_argument(
+        "--joints-passive", action="store_true", help="Leave DXL joint chains torque OFF (exo free)"
+    )
+    ap.add_argument(
+        "--torque-on",
+        action="store_true",
+        help="Force torque ON for DXL chains (overrides --joints-passive)",
+    )
+
+    args = ap.parse_args(argv)
+
+    # Defaults for signs/offsets: common pattern from your config samples
+    # --- Parse IDs (robust: default if omitted) ---
+    left_ids = _parse_int_csv(args.left_ids) if args.left_ids else []
+    right_ids = _parse_int_csv(args.right_ids) if args.right_ids else []
+
+    if args.left_port and not left_ids:
+        left_ids = [1, 2, 3, 4, 5, 6]
+    if args.right_port and not right_ids:
+        right_ids = [10, 11, 12, 13, 14, 15]
+
+    # Defaults for signs/offsets sized to the IDs we now have
+    default_signs = [1, 1, -1, 1, 1, 1]
+    def_signs_L = (default_signs + [1] * 6)[: len(left_ids)] if left_ids else []
+    def_signs_R = (default_signs + [1] * 6)[: len(right_ids)] if right_ids else []
+    def_offs_L = [0.0] * len(left_ids)
+    def_offs_R = [0.0] * len(right_ids)
+
+    left_signs = _parse_signs(args.left_signs, len(left_ids), def_signs_L) if left_ids else []
+    right_signs = _parse_signs(args.right_signs, len(right_ids), def_signs_R) if right_ids else []
+    left_offs = (
+        _parse_offsets_deg(args.left_offsets_deg, len(left_ids), def_offs_L) if left_ids else []
+    )
+    right_offs = (
+        _parse_offsets_deg(args.right_offsets_deg, len(right_ids), def_offs_R) if right_ids else []
+    )
+
+    # Build buses
+    busL = (
+        _build_bus("LEFT", args.left_port, args.baud, left_ids, left_signs, left_offs)
+        if args.left_port
+        else None
+    )
+    busR = (
+        _build_bus("RIGHT", args.right_port, args.baud, right_ids, right_signs, right_offs)
+        if args.right_port
+        else None
+    )
+
+    # UR
+    urL = URSide(args.ur_left) if args.ur_left else None
+    urR = URSide(args.ur_right) if args.ur_right else None
+
+    if not (busL or busR):
+        print("[exit] No DXL buses configured; provide --left-port/--right-port and IDs")
+        return 2
+    if not (urL or urR):
+        print("[exit] No UR IPs provided; use --ur-left/--ur-right")
+        return 2
+
+    try:
+        # Optional torque setup (default passive)
+        if args.torque_on and not args.joints_passive:
+            if busL:
+                busL.torque(True)
+            if busR:
+                busR.torque(True)
+        else:
+            print("[dxl] joints-passive: leaving joint chains torque OFF")
+
+        # Prepare UR receive
+        for ur in (urL, urR):
+            if ur:
+                ur.ensure_receive()
+
+        ft = FollowThread(
+            left=(busL, urL) if (busL and urL) else None,
+            right=(busR, urR) if (busR and urR) else None,
+        )
+
+        # Set up pedal monitoring
+        pedal_monitor = PedalMonitor()
+
+        # Track saved mode for gentle -> full transition (left/center workflow)
+        _saved_mode = None
+
+        # Define pedal callbacks
+        def handle_left_pedal():
+            """Left pedal: Interrupt and start teleop"""
+            nonlocal ft
+            print("[pedal] Starting teleop...")
+            ft.stop()  # Stop any existing operation
+
+            # Reset baselines for fresh start
+            ft.q0_dxl_L = None
+            ft.q0_ur_L = None
+            ft.q0_dxl_R = None
+            ft.q0_ur_R = None
+            ft.t0_L = None
+            ft.t0_R = None
+            ft.y_L = None
+            ft.y_R = None
+            ft.last_qL = None
+            ft.last_qR = None
+            ft.last_move_ts_L = time.monotonic()
+            ft.last_move_ts_R = time.monotonic()
+
+            ft.start()  # Start new teleop
+
+        def _set_gentle_mode():
+            """Set gentler control parameters for test movements."""
+            global GAIN, VMAX, AMAX
+            GAIN_OLD, VMAX_OLD, AMAX_OLD = GAIN, VMAX, AMAX
+            GAIN, VMAX, AMAX = 200, 0.25, 0.6  # softer
+            return GAIN_OLD, VMAX_OLD, AMAX_OLD
+
+        def _restore_mode(old):
+            """Restore original control parameters."""
+            global GAIN, VMAX, AMAX
+            GAIN, VMAX, AMAX = old
+
+        def handle_center_first():
+            """Center pedal first tap: Set motors/offsets and start gentle mode"""
+            nonlocal _saved_mode
+            print("[pedal] Setting motors and offsets (gentle mode)...")
+
+            # Capture baselines here so follow thread will use RELATIVE mapping
+            if ft.left:
+                busL_, urL_ = ft.left
+                ft.q0_dxl_L = busL_.read_present_positions()
+                ft.q0_ur_L = _safe_get_q(urL_)
+                ft.t0_L = time.monotonic()
+                ft.last_move_ts_L = time.monotonic()
+                print(
+                    f"[calib] LEFT baseline set (dxl0 len={len(ft.q0_dxl_L) if ft.q0_dxl_L else 0})"
+                )
+
+            if ft.right:
+                busR_, urR_ = ft.right
+                ft.q0_dxl_R = busR_.read_present_positions()
+                ft.q0_ur_R = _safe_get_q(urR_)
+                ft.t0_R = time.monotonic()
+                ft.last_move_ts_R = time.monotonic()
+                print(
+                    f"[calib] RIGHT baseline set (dxl0 len={len(ft.q0_dxl_R) if ft.q0_dxl_R else 0})"
+                )
+
+            # Set gentle mode for test movements and start
+            _saved_mode = _set_gentle_mode()
+            ft.start()  # Start in gentle mode
+
+        def handle_center_second():
+            """Center pedal second tap: Enable full teleop"""
+            nonlocal _saved_mode
+            print("[pedal] Enabling full teleop...")
+            if _saved_mode is not None:
+                _restore_mode(_saved_mode)
+                _saved_mode = None
+            ft.start()  # Ensure thread is running
+
+        def handle_right_pedal():
+            """Right pedal: Stop teleop"""
+            print("[pedal] Stopping teleop...")
+            ft.stop()
+            # Return to passive mode
+            if busL:
+                busL.torque(False)
+            if busR:
+                busR.torque(False)
+
+        # Assign callbacks
+        pedal_monitor.callback_left = handle_left_pedal
+        pedal_monitor.callback_center_first = handle_center_first
+        pedal_monitor.callback_center_second = handle_center_second
+        pedal_monitor.callback_right = handle_right_pedal
+
+        # Start pedal monitoring
+        if pedal_monitor.connect():
+            pedal_monitor.start_monitoring()
+            print("\nPedal Controls:")
+            print("  - Left pedal (4): Interrupt and start teleop")
+            print("  - Center pedal (5): First tap = set motors (gentle), Second tap = full teleop")
+            print("  - Right pedal (6): Stop teleop and return to normal\n")
+            print("Waiting for pedal input... (Ctrl+C to exit)")
+        else:
+            print("[warn] Pedal device not found. Running without pedal control.")
+            print("Press Ctrl+C to exit.")
+
+        # Keep the main thread alive with a very small sleep
+        try:
+            while True:
+                time.sleep(0.001)
+        except KeyboardInterrupt:
+            print("\n[exit] Shutting down...")
+            ft.stop()
+            if pedal_monitor.device:
+                pedal_monitor.stop_monitoring()
+
+    finally:
+        # Clean down DXL
+        if busL:
+            busL.close()
+        if busR:
+            busR.close()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,41 @@
+agent_params:
+  baudrate: 1000000
+  ids:
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  joint_offsets:
+  - 357.188
+  - 359.824
+  - 153.809
+  - 99.844
+  - 169.453
+  - 179.736
+  - 0.0
+  joint_signs:
+  - 1
+  - 1
+  - -1
+  - 1
+  - 1
+  - 1
+  - 1
+  port: /dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAAMNUF-if00-port0
+  protocol: 2.0
+  start_joints:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+robot: gello.robots.ur.URRobot
+robot_params:
+  acceleration: 0.8
+  host: 192.168.1.210
+  speed: 0.4
