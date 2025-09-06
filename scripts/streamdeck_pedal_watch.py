@@ -22,8 +22,10 @@ Optimizations based on GELLO software:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -701,6 +703,8 @@ class FollowThread:
         self.right_gripper_baseline = 0.0
         self.left_gripper_cmd = 0.0
         self.right_gripper_cmd = 0.0
+        self._left_last_gripper_cmd = 0.0
+        self._right_last_gripper_cmd = 0.0
 
     def capture_baselines(self):
         """Capture current positions as baselines."""
@@ -777,6 +781,55 @@ class FollowThread:
         if self.right_robot:
             self.right_robot.ur.stop_j(self.config.amax)
 
+    def _send_gripper_command(self, side: str, position: float):
+        """Send gripper command via the dexgpt debug_tools script."""
+        try:
+            # Call the actual gripper command script from dexgpt
+            # Path to the dexgpt gripper command script
+            dexgpt_path = os.path.expanduser("~/generalistai/dexgpt")
+            script_path = os.path.join(
+                dexgpt_path, "debug_tools", "send_gripper_cmd.py"
+            )
+
+            # Build the command
+            cmd = [
+                "python",
+                script_path,
+                "-o",
+                f"gripper_command_{side}",
+                "--position",
+                str(position),
+            ]
+
+            # Execute the command (non-blocking with timeout)
+            subprocess.run(
+                cmd,
+                cwd=dexgpt_path,  # Run from dexgpt directory
+                capture_output=True,
+                timeout=0.5,  # 500ms timeout to prevent blocking
+                check=False,  # Don't raise on non-zero exit
+            )
+
+            # Optional: Also save to JSON for debugging/monitoring
+            command_file = f"/tmp/gripper_command_{side}.json"
+            command_data = {
+                "timestamp": time.time(),
+                "position": position,
+                "side": side,
+                "sent_via": "dexgpt",
+            }
+            with open(command_file, "w") as f:
+                json.dump(command_data, f)
+
+        except subprocess.TimeoutExpired:
+            # Command took too long, but don't stop teleop
+            pass
+        except Exception as e:
+            # Don't let gripper errors stop teleop
+            if self.config.debug.get("verbose", False):
+                print(f"[gripper] Error sending command: {e}")
+            pass
+
     def _ensure_ur_ready(self, robot: URDynamixelRobot) -> bool:
         """Ensure UR is ready for control."""
         if not robot.ur.ensure_control():
@@ -827,26 +880,44 @@ class FollowThread:
                     # Handle gripper if available (7th joint)
                     if self.config.gripper_enabled and len(dxl_pos) > 6:
                         gripper_pos = dxl_pos[6]
-                        # Map DXL gripper position to UR gripper command
-                        # DXL gripper range: check your specific servo
-                        # UR gripper expects: 0 = fully closed, 1 = fully open
 
-                        # Normalize based on DXL gripper physical range
-                        # These values work for most XL330 servos
-                        gripper_min = -1.5  # Closed position in radians
-                        gripper_max = 1.5  # Open position in radians
+                        # Map DXL gripper position to actual gripper commands
+                        # DXL gripper physical range (adjust for your servo)
+                        gripper_threshold = 0.0  # Threshold between open and closed
 
-                        # Normalize to 0-1 range
-                        gripper_normalized = (gripper_pos - gripper_min) / (
-                            gripper_max - gripper_min
+                        # Actual gripper command values (from user testing)
+                        GRIPPER_CLOSED = (
+                            -0.1
+                        )  # Command when GELLO gripper is activated/closed
+                        GRIPPER_OPEN = (
+                            0.25  # Command when GELLO gripper is released/open
                         )
-                        gripper_normalized = np.clip(gripper_normalized, 0.0, 1.0)
 
-                        # Some grippers need inverted logic
-                        # gripper_normalized = 1.0 - gripper_normalized
+                        # Determine gripper state based on position
+                        if gripper_pos < gripper_threshold:
+                            # GELLO gripper is closed/activated
+                            gripper_cmd = GRIPPER_CLOSED
+                        else:
+                            # GELLO gripper is open/released
+                            gripper_cmd = GRIPPER_OPEN
 
-                        # Store for potential gripper command
-                        self.left_gripper_cmd = gripper_normalized
+                        # Store gripper command for external use
+                        self.left_gripper_cmd = gripper_cmd
+
+                        # Send actual gripper command if changed (with hysteresis)
+                        if not hasattr(self, "_left_last_sent_cmd"):
+                            self._left_last_sent_cmd = gripper_cmd
+                            print(
+                                f"[LEFT GRIPPER] Initial state: {'CLOSED' if gripper_cmd < 0 else 'OPEN'} (pos: {gripper_pos:.3f} rad, cmd: {gripper_cmd})"
+                            )
+                            self._send_gripper_command("left", gripper_cmd)
+                        elif abs(gripper_cmd - self._left_last_sent_cmd) > 0.05:
+                            # Only send if significantly different
+                            print(
+                                f"[LEFT GRIPPER] Changed to: {'CLOSED' if gripper_cmd < 0 else 'OPEN'} (pos: {gripper_pos:.3f} rad, cmd: {gripper_cmd})"
+                            )
+                            self._left_last_sent_cmd = gripper_cmd
+                            self._send_gripper_command("left", gripper_cmd)
 
                     # Send servoJ command
                     try:
@@ -892,26 +963,44 @@ class FollowThread:
                     # Handle gripper if available (7th joint)
                     if self.config.gripper_enabled and len(dxl_pos) > 6:
                         gripper_pos = dxl_pos[6]
-                        # Map DXL gripper position to UR gripper command
-                        # DXL gripper range: check your specific servo
-                        # UR gripper expects: 0 = fully closed, 1 = fully open
 
-                        # Normalize based on DXL gripper physical range
-                        # These values work for most XL330 servos
-                        gripper_min = -1.5  # Closed position in radians
-                        gripper_max = 1.5  # Open position in radians
+                        # Map DXL gripper position to actual gripper commands
+                        # DXL gripper physical range (adjust for your servo)
+                        gripper_threshold = 0.0  # Threshold between open and closed
 
-                        # Normalize to 0-1 range
-                        gripper_normalized = (gripper_pos - gripper_min) / (
-                            gripper_max - gripper_min
+                        # Actual gripper command values (from user testing)
+                        GRIPPER_CLOSED = (
+                            -0.1
+                        )  # Command when GELLO gripper is activated/closed
+                        GRIPPER_OPEN = (
+                            0.25  # Command when GELLO gripper is released/open
                         )
-                        gripper_normalized = np.clip(gripper_normalized, 0.0, 1.0)
 
-                        # Some grippers need inverted logic
-                        # gripper_normalized = 1.0 - gripper_normalized
+                        # Determine gripper state based on position
+                        if gripper_pos < gripper_threshold:
+                            # GELLO gripper is closed/activated
+                            gripper_cmd = GRIPPER_CLOSED
+                        else:
+                            # GELLO gripper is open/released
+                            gripper_cmd = GRIPPER_OPEN
 
-                        # Store for potential gripper command
-                        self.right_gripper_cmd = gripper_normalized
+                        # Store gripper command for external use
+                        self.right_gripper_cmd = gripper_cmd
+
+                        # Send actual gripper command if changed (with hysteresis)
+                        if not hasattr(self, "_right_last_sent_cmd"):
+                            self._right_last_sent_cmd = gripper_cmd
+                            print(
+                                f"[RIGHT GRIPPER] Initial state: {'CLOSED' if gripper_cmd < 0 else 'OPEN'} (pos: {gripper_pos:.3f} rad, cmd: {gripper_cmd})"
+                            )
+                            self._send_gripper_command("right", gripper_cmd)
+                        elif abs(gripper_cmd - self._right_last_sent_cmd) > 0.05:
+                            # Only send if significantly different
+                            print(
+                                f"[RIGHT GRIPPER] Changed to: {'CLOSED' if gripper_cmd < 0 else 'OPEN'} (pos: {gripper_pos:.3f} rad, cmd: {gripper_cmd})"
+                            )
+                            self._right_last_sent_cmd = gripper_cmd
+                            self._send_gripper_command("right", gripper_cmd)
 
                     # Send servoJ command
                     try:

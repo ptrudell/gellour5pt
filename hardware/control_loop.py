@@ -121,15 +121,27 @@ class SmoothMotionController:
         # Extra damping based on motion state
         if not is_moving:
             # Check if we're truly stationary (very small delta)
-            stationary_threshold = 0.002  # radians
+            stationary_threshold = 0.001  # radians - tighter threshold
             is_stationary = np.all(np.abs(delta) < stationary_threshold)
 
             if is_stationary:
                 # Near-zero the delta to prevent any drift
-                delta = delta * 0.05  # Very strong damping when stationary
+                delta = (
+                    delta * 0.01
+                )  # Extremely strong damping when stationary (99% reduction)
             else:
-                # Normal damping when just not actively moving
-                delta = delta * 0.3  # Strong damping when stopped
+                # Check for nearly stationary (slightly larger movements)
+                nearly_stationary_threshold = 0.003  # radians
+                is_nearly_stationary = np.all(
+                    np.abs(delta) < nearly_stationary_threshold
+                )
+
+                if is_nearly_stationary:
+                    # Still very strong damping for small movements
+                    delta = delta * 0.1  # 90% reduction for small movements
+                else:
+                    # Normal damping when just not actively moving
+                    delta = delta * 0.3  # Strong damping when stopped
 
         # Compute target = UR baseline + scaled delta
         target = self._baseline_ur + delta
