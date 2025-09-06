@@ -34,12 +34,14 @@ control:
   gain: 340
   velocity_max: 1.4  # rad/s - can be overridden by UR_VMAX env var
   acceleration_max: 4.0  # rad/s² - can be overridden by UR_AMAX env var
+  gripper_enabled: true  # Enable gripper control via 7th DXL joint
+  gripper_threshold: 0.1  # Threshold for gripper motion detection
 
 # Motion shaping parameters
 motion_shaping:
-  ema_alpha: 0.12  # Exponential moving average smoothing
-  softstart_time: 0.20  # seconds
-  deadband_deg: [1, 1, 1, 1, 1, 2, 1]  # Per-joint deadbands + gripper
+  ema_alpha: 0.08  # Reduced for less smoothing lag (was 0.12)
+  softstart_time: 0.15  # Faster startup (was 0.20)
+  deadband_deg: [0.5, 0.5, 0.5, 0.5, 0.5, 1.0, 0.5]  # Tighter deadbands for less drift
   scale: [1, 1, 1, 1, 1, 1, 1]  # Per-joint gains + gripper
   clamp_rad: [null, null, null, null, null, 0.8, null]  # Wrist clamp
   

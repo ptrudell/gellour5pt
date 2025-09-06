@@ -68,8 +68,9 @@ class SmoothMotionController:
         # Inactivity detection
         self._last_positions: Optional[np.ndarray] = None
         self._last_move_time = time.monotonic()
-        self._inactivity_threshold = 0.3  # seconds
-        self._rebase_beta = 0.1
+        self._inactivity_threshold = 0.05  # seconds - faster response to stop
+        self._rebase_beta = 0.02  # slower rebaselining to reduce drift
+        self._motion_threshold = 0.001  # radians - minimum motion to detect movement
 
     def reset(self):
         """Reset controller state."""
@@ -117,6 +118,19 @@ class SmoothMotionController:
         # Apply deadband and scaling
         delta = self._apply_deadband_scale(delta)
 
+        # Extra damping based on motion state
+        if not is_moving:
+            # Check if we're truly stationary (very small delta)
+            stationary_threshold = 0.002  # radians
+            is_stationary = np.all(np.abs(delta) < stationary_threshold)
+
+            if is_stationary:
+                # Near-zero the delta to prevent any drift
+                delta = delta * 0.05  # Very strong damping when stationary
+            else:
+                # Normal damping when just not actively moving
+                delta = delta * 0.3  # Strong damping when stopped
+
         # Compute target = UR baseline + scaled delta
         target = self._baseline_ur + delta
 
@@ -141,20 +155,25 @@ class SmoothMotionController:
         max_change = np.abs(positions - self._last_positions).max()
         self._last_positions = positions.copy()
 
-        if max_change > 0.0025:  # ~0.14 degrees
+        if max_change > self._motion_threshold:
             self._last_move_time = time.monotonic()
             return True
 
         return False
 
     def _handle_inactivity(self, positions: np.ndarray):
-        """Gradually rebaseline during inactivity to prevent drift."""
+        """Handle inactivity to prevent drift and random movements."""
         now = time.monotonic()
         if (now - self._last_move_time) > self._inactivity_threshold:
-            # Slowly pull baseline toward current position
-            self._baseline_dxl = (
-                1.0 - self._rebase_beta
-            ) * self._baseline_dxl + self._rebase_beta * positions
+            # Dampen velocity to zero when inactive
+            if self._velocities is not None:
+                self._velocities = self._velocities * 0.7  # Quick damping
+
+            # Very slowly pull baseline toward current position to prevent drift
+            if (now - self._last_move_time) > 1.0:  # Only after 1 second of inactivity
+                self._baseline_dxl = (
+                    1.0 - self._rebase_beta
+                ) * self._baseline_dxl + self._rebase_beta * positions
 
     def _apply_deadband_scale(self, delta: np.ndarray) -> np.ndarray:
         """Apply per-joint deadband and scaling."""

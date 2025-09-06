@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 Optimized DXL→UR joint teleop using GELLO software patterns.
 StreamDeck pedal control with interrupt-first flow and smooth tracking.
@@ -88,6 +89,12 @@ class Config:
         self.amax = float(
             os.environ.get("UR_AMAX", str(self.control.get("acceleration_max", 4.0)))
         )
+
+        # Gripper configuration
+        self.gripper_enabled = self.control.get("gripper_enabled", True)
+        self.gripper_threshold = self.control.get(
+            "gripper_threshold", 0.5
+        )  # For open/close
 
         # Motion shaping
         self.ema_alpha = self.motion_shaping.get("ema_alpha", 0.12)
@@ -651,9 +658,15 @@ class FollowThread:
             acceleration_max=config.amax,
             ema_alpha=config.ema_alpha,
             softstart_time=config.softstart_time,
-            deadband_rad=config.deadband_rad,
-            scale_factors=config.scale,
-            clamp_rad=config.clamp_rad,
+            deadband_rad=config.deadband_rad[:6]
+            if len(config.deadband_rad) > 6
+            else config.deadband_rad,  # Only first 6 for UR
+            scale_factors=config.scale[:6]
+            if len(config.scale) > 6
+            else config.scale,  # Only first 6 for UR
+            clamp_rad=config.clamp_rad[:6]
+            if len(config.clamp_rad) > 6
+            else config.clamp_rad,  # Only first 6 for UR
         )
 
         self.left_controller = (
@@ -683,35 +696,69 @@ class FollowThread:
         self.error_count = {"left": 0, "right": 0}
         self.max_errors = config.safety.get("max_control_errors", 2)
 
+        # Gripper state tracking
+        self.left_gripper_baseline = 0.0
+        self.right_gripper_baseline = 0.0
+        self.left_gripper_cmd = 0.0
+        self.right_gripper_cmd = 0.0
+
     def capture_baselines(self):
         """Capture current positions as baselines."""
+        success = False
+
         # Left robot
         if self.left_robot and self.left_controller:
-            dxl_pos = self.left_robot.dxl.read_positions()
-            ur_pos = self.left_robot.ur.get_joint_positions()
+            try:
+                dxl_pos = self.left_robot.dxl.read_positions()
+                ur_pos = self.left_robot.ur.get_joint_positions()
 
-            if dxl_pos is not None and ur_pos is not None:
-                # Only first 6 joints for UR
-                self.left_controller.set_baselines(dxl_pos[:6], ur_pos)
-                print(
-                    f"   ✓ LEFT arm: {len(dxl_pos)} DXL joints, {len(ur_pos)} UR joints captured"
-                )
-            else:
-                print("   ✗ LEFT arm: Failed to read positions")
+                if dxl_pos is not None and ur_pos is not None:
+                    # Only first 6 joints for UR
+                    self.left_controller.set_baselines(dxl_pos[:6], ur_pos)
+                    # Capture gripper baseline if available
+                    if len(dxl_pos) > 6:
+                        self.left_gripper_baseline = dxl_pos[6]
+                    else:
+                        self.left_gripper_baseline = 0.0
+                    print(
+                        f"   ✓ LEFT arm: {min(6, len(dxl_pos))} DXL joints, {len(ur_pos)} UR joints, gripper={len(dxl_pos) > 6}"
+                    )
+                    success = True
+                else:
+                    if dxl_pos is None:
+                        print("   ✗ LEFT arm: DXL servos not responding")
+                    if ur_pos is None:
+                        print("   ✗ LEFT arm: UR not responding")
+            except Exception as e:
+                print(f"   ✗ LEFT arm: Error reading positions - {e}")
 
         # Right robot
         if self.right_robot and self.right_controller:
-            dxl_pos = self.right_robot.dxl.read_positions()
-            ur_pos = self.right_robot.ur.get_joint_positions()
+            try:
+                dxl_pos = self.right_robot.dxl.read_positions()
+                ur_pos = self.right_robot.ur.get_joint_positions()
 
-            if dxl_pos is not None and ur_pos is not None:
-                # Only first 6 joints for UR
-                self.right_controller.set_baselines(dxl_pos[:6], ur_pos)
-                print(
-                    f"   ✓ RIGHT arm: {len(dxl_pos)} DXL joints, {len(ur_pos)} UR joints captured"
-                )
-            else:
-                print("   ✗ RIGHT arm: Failed to read positions")
+                if dxl_pos is not None and ur_pos is not None:
+                    # Only first 6 joints for UR
+                    self.right_controller.set_baselines(dxl_pos[:6], ur_pos)
+                    # Capture gripper baseline if available
+                    if len(dxl_pos) > 6:
+                        self.right_gripper_baseline = dxl_pos[6]
+                    else:
+                        self.right_gripper_baseline = 0.0
+                    print(
+                        f"   ✓ RIGHT arm: {min(6, len(dxl_pos))} DXL joints, {len(ur_pos)} UR joints, gripper={len(dxl_pos) > 6}"
+                    )
+                    success = True
+                else:
+                    if dxl_pos is None:
+                        print("   ✗ RIGHT arm: DXL servos not responding")
+                    if ur_pos is None:
+                        print("   ✗ RIGHT arm: UR not responding")
+            except Exception as e:
+                print(f"   ✗ RIGHT arm: Error reading positions - {e}")
+
+        return success
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -771,9 +818,35 @@ class FollowThread:
                     # Auto-initialize baselines on first run if needed
                     if self.left_controller._baseline_dxl is None:
                         self.left_controller.set_baselines(dxl_pos[:6], ur_pos)
+                        if len(dxl_pos) > 6:
+                            self.left_gripper_baseline = dxl_pos[6]
 
-                    # Update controller and get target positions
+                    # Update controller and get target positions (only first 6 joints)
                     target, is_moving = self.left_controller.update(dxl_pos[:6], ur_pos)
+
+                    # Handle gripper if available (7th joint)
+                    if self.config.gripper_enabled and len(dxl_pos) > 6:
+                        gripper_pos = dxl_pos[6]
+                        # Map DXL gripper position to UR gripper command
+                        # DXL gripper range: check your specific servo
+                        # UR gripper expects: 0 = fully closed, 1 = fully open
+
+                        # Normalize based on DXL gripper physical range
+                        # These values work for most XL330 servos
+                        gripper_min = -1.5  # Closed position in radians
+                        gripper_max = 1.5  # Open position in radians
+
+                        # Normalize to 0-1 range
+                        gripper_normalized = (gripper_pos - gripper_min) / (
+                            gripper_max - gripper_min
+                        )
+                        gripper_normalized = np.clip(gripper_normalized, 0.0, 1.0)
+
+                        # Some grippers need inverted logic
+                        # gripper_normalized = 1.0 - gripper_normalized
+
+                        # Store for potential gripper command
+                        self.left_gripper_cmd = gripper_normalized
 
                     # Send servoJ command
                     try:
@@ -808,11 +881,37 @@ class FollowThread:
                     # Auto-initialize baselines on first run if needed
                     if self.right_controller._baseline_dxl is None:
                         self.right_controller.set_baselines(dxl_pos[:6], ur_pos)
+                        if len(dxl_pos) > 6:
+                            self.right_gripper_baseline = dxl_pos[6]
 
-                    # Update controller and get target positions
+                    # Update controller and get target positions (only first 6 joints)
                     target, is_moving = self.right_controller.update(
                         dxl_pos[:6], ur_pos
                     )
+
+                    # Handle gripper if available (7th joint)
+                    if self.config.gripper_enabled and len(dxl_pos) > 6:
+                        gripper_pos = dxl_pos[6]
+                        # Map DXL gripper position to UR gripper command
+                        # DXL gripper range: check your specific servo
+                        # UR gripper expects: 0 = fully closed, 1 = fully open
+
+                        # Normalize based on DXL gripper physical range
+                        # These values work for most XL330 servos
+                        gripper_min = -1.5  # Closed position in radians
+                        gripper_max = 1.5  # Open position in radians
+
+                        # Normalize to 0-1 range
+                        gripper_normalized = (gripper_pos - gripper_min) / (
+                            gripper_max - gripper_min
+                        )
+                        gripper_normalized = np.clip(gripper_normalized, 0.0, 1.0)
+
+                        # Some grippers need inverted logic
+                        # gripper_normalized = 1.0 - gripper_normalized
+
+                        # Store for potential gripper command
+                        self.right_gripper_cmd = gripper_normalized
 
                     # Send servoJ command
                     try:
@@ -855,8 +954,9 @@ class FollowThread:
 def _build_robot(
     config: Config,
     side: str,  # "left" or "right"
+    retry_dxl: bool = True,
 ) -> Optional[URDynamixelRobot]:
-    """Build a URDynamixelRobot from config."""
+    """Build a URDynamixelRobot from config with better error handling."""
     robot_config = getattr(config, f"{side}_robot", {})
 
     if not robot_config:
@@ -884,16 +984,25 @@ def _build_robot(
         control_frequency=config.hz,
     )
 
-    # Connect
+    # Connect with retry logic for DXL
     ur_ok, dxl_ok = robot.connect()
+
+    # If DXL fails, try once more after a short delay
+    if not dxl_ok and retry_dxl:
+        print(f"[{side}] DXL connection failed, retrying...")
+        time.sleep(0.5)
+        robot.dxl.disconnect()
+        dxl_ok = robot.dxl.connect()
+
     print(
         f"[{side}] UR: {'connected' if ur_ok else 'FAILED'}, DXL: {'connected' if dxl_ok else 'FAILED'}"
     )
 
     if not dxl_ok:
-        print(f"[{side}] Failed to connect to Dynamixel servos")
-        robot.disconnect()
-        return None
+        print(f"[{side}] WARNING: Dynamixel servos not responding")
+        print(f"       Port: {dxl_port}")
+        print(f"       IDs: {dxl_ids}")
+        # Don't return None - let it work with UR only
 
     return robot
 
@@ -1109,6 +1218,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Define pedal callbacks
         def on_left_interrupt():
             """INTERRUPT: Stop URs for external program control."""
+            nonlocal left_robot, right_robot
+
             # Stop the follow thread
             if ft._thread and ft._thread.is_alive():
                 ft.stop()
@@ -1126,15 +1237,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if ft.right_controller:
                 ft.right_controller.reset()
 
+            # Clear robot references so they get rebuilt on next use
+            left_robot = None
+            right_robot = None
+
         def on_center_first():
             """PREP: capture baselines, gentle mode, no streaming yet."""
-            nonlocal _saved_mode
+            nonlocal _saved_mode, left_robot, right_robot
+
+            # Rebuild robots if they were disconnected
+            if left_robot is None:
+                print("[prep] Rebuilding LEFT robot connection...")
+                left_robot = _build_robot(config, "left")
+                if left_robot:
+                    ft.left_robot = left_robot
+
+            if right_robot is None:
+                print("[prep] Rebuilding RIGHT robot connection...")
+                right_robot = _build_robot(config, "right")
+                if right_robot:
+                    ft.right_robot = right_robot
+
             _saved_mode = _set_gentle_mode(config)
 
-            # Capture baselines
+            # Capture baselines with error checking
             ft.capture_baselines()
 
-            # Reconnect URs if needed
+            # Ensure UR control is ready
             for robot in (left_robot, right_robot):
                 if robot:
                     robot.ur.ensure_control()
@@ -1176,13 +1305,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("   [2/4] Disconnecting robots...")
             for robot in (left_robot, right_robot):
                 if robot:
-                    robot.disconnect()
+                    try:
+                        robot.disconnect()
+                    except Exception:
+                        pass  # Ignore errors during shutdown
 
-            # Set DXL to passive
+            # Set DXL to passive with timeout
             print("   [3/4] Setting servos to passive...")
-            for robot in (left_robot, right_robot):
-                if robot:
-                    robot.set_dxl_torque(False)
+
+            def set_passive_with_timeout():
+                for robot in (left_robot, right_robot):
+                    if robot:
+                        try:
+                            robot.set_dxl_torque(False)
+                        except Exception:
+                            pass  # Ignore errors
+
+            # Use threading with timeout to prevent hanging
+            import threading
+
+            passive_thread = threading.Thread(target=set_passive_with_timeout)
+            passive_thread.daemon = True  # Make it daemon so it doesn't block exit
+            passive_thread.start()
+            passive_thread.join(timeout=0.5)  # 500ms timeout
+
+            if passive_thread.is_alive():
+                print("       (Skipped - timeout)")
 
             # Clear connections
             print("   [4/4] Clearing connections...")
@@ -1193,7 +1341,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 robot_hosts.append(right_robot.ur.host)
 
             if robot_hosts:
-                clear_robots_quietly(robot_hosts)
+                try:
+                    clear_robots_quietly(robot_hosts)
+                except Exception:
+                    pass  # Ignore errors
 
             # Reset state
             pedal_monitor.state = TeleopState.IDLE
