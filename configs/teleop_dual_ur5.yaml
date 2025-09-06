@@ -39,16 +39,16 @@ control:
 
 # Motion shaping parameters
 motion_shaping:
-  ema_alpha: 0.06  # Further reduced for less lag (was 0.08)
-  softstart_time: 0.10  # Even faster startup (was 0.15)
-  deadband_deg: [0.3, 0.3, 0.3, 0.3, 0.3, 0.5, 0.3]  # Very tight deadbands to eliminate drift
+  ema_alpha: 0.03  # ULTRA smooth to prevent drift (was 0.06)
+  softstart_time: 0.15  # Slower startup to prevent jerks (was 0.10)
+  deadband_deg: [0.8, 0.8, 0.8, 0.8, 0.8, 1.2, 0.8]  # Larger deadbands to completely eliminate drift
   scale: [1, 1, 1, 1, 1, 1, 1]  # Per-joint gains + gripper
   clamp_rad: [null, null, null, null, null, 0.8, null]  # Wrist clamp
   
   # Inactivity handling
-  inactivity_rebase_s: 0.3
-  rebase_beta: 0.10
-  snap_epsilon_rad: 0.005
+  inactivity_rebase_s: 1.0  # Wait longer before rebaselining (was 0.3)
+  rebase_beta: 0.001  # VERY slow rebaselining to prevent drift (was 0.10)
+  snap_epsilon_rad: 0.002  # Tighter snap threshold (was 0.005)
   
   # Velocity and acceleration limits
   vel_limit_rad_s: 6.0

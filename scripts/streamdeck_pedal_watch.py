@@ -882,8 +882,9 @@ class FollowThread:
                         gripper_pos = dxl_pos[6]
 
                         # Map DXL gripper position to actual gripper commands
-                        # DXL gripper physical range (adjust for your servo)
-                        gripper_threshold = 0.0  # Threshold between open and closed
+                        # Based on actual test results for LEFT gripper:
+                        # MIN: 2.5112 rad (closed), MAX: 3.4316 rad (open)
+                        gripper_threshold = 2.97  # Midpoint between closed and open
 
                         # Actual gripper command values (from user testing)
                         GRIPPER_CLOSED = (
@@ -894,6 +895,7 @@ class FollowThread:
                         )
 
                         # Determine gripper state based on position
+                        # LEFT gripper: lower values = closed, higher values = open
                         if gripper_pos < gripper_threshold:
                             # GELLO gripper is closed/activated
                             gripper_cmd = GRIPPER_CLOSED
@@ -965,8 +967,9 @@ class FollowThread:
                         gripper_pos = dxl_pos[6]
 
                         # Map DXL gripper position to actual gripper commands
-                        # DXL gripper physical range (adjust for your servo)
-                        gripper_threshold = 0.0  # Threshold between open and closed
+                        # Based on actual test results for RIGHT gripper:
+                        # MIN: 4.1050 rad (closed), MAX: 5.0929 rad (open)
+                        gripper_threshold = 4.60  # Midpoint between closed and open
 
                         # Actual gripper command values (from user testing)
                         GRIPPER_CLOSED = (
@@ -977,6 +980,7 @@ class FollowThread:
                         )
 
                         # Determine gripper state based on position
+                        # RIGHT gripper: lower values = closed, higher values = open
                         if gripper_pos < gripper_threshold:
                             # GELLO gripper is closed/activated
                             gripper_cmd = GRIPPER_CLOSED

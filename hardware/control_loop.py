@@ -118,30 +118,36 @@ class SmoothMotionController:
         # Apply deadband and scaling
         delta = self._apply_deadband_scale(delta)
 
-        # Extra damping based on motion state
+        # Extra damping based on motion state - VERY aggressive to prevent drift
         if not is_moving:
-            # Check if we're truly stationary (very small delta)
-            stationary_threshold = 0.001  # radians - tighter threshold
+            # Check if we're truly stationary (EXTREMELY small delta)
+            stationary_threshold = 0.0003  # radians - ULTRA tight threshold
             is_stationary = np.all(np.abs(delta) < stationary_threshold)
 
             if is_stationary:
-                # Near-zero the delta to prevent any drift
-                delta = (
-                    delta * 0.01
-                )  # Extremely strong damping when stationary (99% reduction)
+                # Completely kill the delta to prevent ANY drift
+                delta = delta * 0.0  # 100% damping - NO movement when truly stationary
             else:
-                # Check for nearly stationary (slightly larger movements)
-                nearly_stationary_threshold = 0.003  # radians
+                # Check for nearly stationary (very small movements)
+                nearly_stationary_threshold = 0.001  # radians - much tighter
                 is_nearly_stationary = np.all(
                     np.abs(delta) < nearly_stationary_threshold
                 )
 
                 if is_nearly_stationary:
-                    # Still very strong damping for small movements
-                    delta = delta * 0.1  # 90% reduction for small movements
+                    # Extreme damping for tiny movements
+                    delta = delta * 0.005  # 99.5% reduction for tiny movements
                 else:
-                    # Normal damping when just not actively moving
-                    delta = delta * 0.3  # Strong damping when stopped
+                    # Check for slow movements
+                    slow_threshold = 0.003  # radians
+                    is_slow = np.all(np.abs(delta) < slow_threshold)
+
+                    if is_slow:
+                        # Very strong damping for slow movements
+                        delta = delta * 0.05  # 95% reduction when moving slowly
+                    else:
+                        # Strong damping even for larger stopped movements
+                        delta = delta * 0.15  # 85% reduction when stopped
 
         # Compute target = UR baseline + scaled delta
         target = self._baseline_ur + delta
@@ -179,10 +185,10 @@ class SmoothMotionController:
         if (now - self._last_move_time) > self._inactivity_threshold:
             # Dampen velocity to zero when inactive
             if self._velocities is not None:
-                self._velocities = self._velocities * 0.7  # Quick damping
+                self._velocities = self._velocities * 0.5  # Aggressive damping
 
-            # Very slowly pull baseline toward current position to prevent drift
-            if (now - self._last_move_time) > 1.0:  # Only after 1 second of inactivity
+            # VERY slowly pull baseline toward current position to prevent drift
+            if (now - self._last_move_time) > 3.0:  # Only after 3 seconds of inactivity
                 self._baseline_dxl = (
                     1.0 - self._rebase_beta
                 ) * self._baseline_dxl + self._rebase_beta * positions
