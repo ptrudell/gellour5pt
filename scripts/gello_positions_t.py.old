@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""
+ZCM message type for GELLO arm positions.
+Compatible with zerocm for publishing joint and gripper positions.
+"""
+
+
+class gello_positions_t:
+    """
+    Message type for GELLO arm positions (6 joints + 1 gripper).
+
+    Attributes:
+        timestamp: Time in microseconds since epoch
+        joint_positions: Array of 6 joint positions in radians
+        gripper_position: Gripper position in radians
+        joint_velocities: Array of 6 joint velocities in rad/s (optional, can be zeros)
+        is_valid: Boolean indicating if data is valid
+        arm_side: String indicating 'left' or 'right' arm
+    """
+
+    def __init__(self):
+        self.timestamp = 0  # int64 - microseconds since epoch
+        self.joint_positions = [0.0] * 6  # float64[6] - joint angles in radians
+        self.gripper_position = 0.0  # float64 - gripper angle in radians
+        self.joint_velocities = [0.0] * 6  # float64[6] - joint velocities in rad/s
+        self.is_valid = False  # bool - data validity flag
+        self.arm_side = ""  # string - "left" or "right"
+
+    def encode(self):
+        """Encode message for ZCM transmission."""
+        import struct
+
+        # Pack the message
+        # Format: Q (uint64 timestamp), 6d (joint_positions), d (gripper),
+        #         6d (velocities), ? (bool is_valid), H (string length), string
+
+        arm_bytes = self.arm_side.encode("utf-8")
+        arm_len = len(arm_bytes)
+
+        format_str = "Q" + "6d" + "d" + "6d" + "?" + "H" + f"{arm_len}s"
+
+        data = struct.pack(
+            format_str,
+            self.timestamp,
+            *self.joint_positions,
+            self.gripper_position,
+            *self.joint_velocities,
+            self.is_valid,
+            arm_len,
+            arm_bytes,
+        )
+
+        return data
+
+    def decode(self, data):
+        """Decode message from ZCM transmission."""
+        import struct
+
+        # First unpack everything except the string
+        fixed_size = struct.calcsize("Q" + "6d" + "d" + "6d" + "?" + "H")
+        fixed_data = struct.unpack(
+            "Q" + "6d" + "d" + "6d" + "?" + "H", data[:fixed_size]
+        )
+
+        self.timestamp = fixed_data[0]
+        self.joint_positions = list(fixed_data[1:7])
+        self.gripper_position = fixed_data[7]
+        self.joint_velocities = list(fixed_data[8:14])
+        self.is_valid = fixed_data[14]
+        arm_len = fixed_data[15]
+
+        # Now unpack the string
+        if arm_len > 0:
+            arm_bytes = struct.unpack(
+                f"{arm_len}s", data[fixed_size : fixed_size + arm_len]
+            )[0]
+            self.arm_side = arm_bytes.decode("utf-8")
+        else:
+            self.arm_side = ""
+
+        return self
+
+    def __str__(self):
+        """String representation of the message."""
+        joints_str = ", ".join([f"{j:.3f}" for j in self.joint_positions])
+        return (
+            f"GelloPositions({self.arm_side}): "
+            f"joints=[{joints_str}] rad, "
+            f"gripper={self.gripper_position:.3f} rad, "
+            f"valid={self.is_valid}"
+        )

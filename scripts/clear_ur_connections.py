@@ -1,192 +1,207 @@
 #!/usr/bin/env python3
 """
-Clear stuck RTDE connections on UR robots.
-Run this if you get "Another thread is already controlling the robot" errors.
+Clear UR robot connections and prepare for teleoperation.
+This script clears RTDE connections and ensures robots are ready.
 """
 
 import socket
+import subprocess
 import sys
 import time
 
-# Try importing UR RTDE modules
-try:
-    from rtde_control import RTDEControlInterface
-    from rtde_receive import RTDEReceiveInterface
-except ImportError:
+
+def clear_robot_connection(host):
+    """Clear all connections to a UR robot."""
+    print(f"\n[{host}] Clearing connections...")
+
+    # Try to kill any existing RTDE connections
     try:
-        from ur_rtde import rtde_control, rtde_receive
+        # Connect to dashboard
+        dash_sock = socket.create_connection((host, 29999), timeout=2)
+        dash_sock.recv(4096)  # Welcome message
 
-        RTDEControlInterface = rtde_control.RTDEControlInterface
-        RTDEReceiveInterface = rtde_receive.RTDEReceiveInterface
-    except ImportError:
-        print("Error: UR RTDE modules not found. Install with: pip install ur_rtde")
-        sys.exit(1)
+        # Send commands to reset state
+        commands = [
+            "stop",
+            "close safety popup",
+            "unlock protective stop",
+            "power on",
+            "brake release",
+        ]
 
+        for cmd in commands:
+            dash_sock.send((cmd + "\n").encode())
+            response = dash_sock.recv(4096).decode()
+            if "Error" not in response:
+                print(f"  ✓ {cmd}")
+            time.sleep(0.1)
 
-def dashboard_cmd(host: str, cmd: str) -> str:
-    """Send dashboard command to UR robot."""
-    try:
-        s = socket.create_connection((host, 29999), timeout=2.0)
-        s.recv(4096)  # Welcome message
-        s.send((cmd + "\n").encode())
-        response = s.recv(4096).decode().strip()
-        s.close()
-        return response
+        dash_sock.close()
+        print("  ✓ Dashboard commands sent")
+
     except Exception as e:
-        return f"Error: {e}"
+        print(f"  ✗ Dashboard error: {e}")
+        return False
 
-
-def clear_connections(host: str, verbose: bool = True, reload_external_control: bool = False):
-    """Clear all RTDE connections for a UR robot.
-
-    Args:
-        host: IP address of the UR robot
-        verbose: If True, print detailed progress
-        reload_external_control: If True, reload ExternalControl.urp (requires dashboard access)
-
-    Returns:
-        bool: True if connections cleared successfully
-    """
-    if verbose:
-        print(f"\n{'=' * 50}")
-        print(f"Clearing connections for UR at {host}")
-        print("=" * 50)
-
-    success = True
-
-    # Step 1: Try to stop any running program
-    if verbose:
-        print("1. Stopping any running program...")
-    result = dashboard_cmd(host, "stop")
-    if verbose:
-        print(f"   Response: {result}")
+    # Small delay to let robot process
     time.sleep(0.5)
 
-    # Step 2: Try to create and immediately close control connections
-    if verbose:
-        print("2. Attempting to clear RTDE control connections...")
-    for i in range(3):
-        try:
-            ctrl = RTDEControlInterface(host)
-            if verbose:
-                print(f"   Connection {i + 1}: Created successfully")
-            try:
-                ctrl.stopJ(2.0)  # Stop any motion
-                if verbose:
-                    print(f"   Connection {i + 1}: Sent stop command")
-            except Exception:
-                pass
-            ctrl.disconnect()
-            if verbose:
-                print(f"   Connection {i + 1}: Disconnected")
-            del ctrl
-            time.sleep(0.2)
-        except Exception as e:
-            if verbose:
-                print(f"   Connection {i + 1}: {e}")
-            if "another thread" in str(e).lower():
-                if verbose:
-                    print("   -> Blocked by existing connection, waiting...")
-                time.sleep(1.0)
-
-    # Step 3: Optionally restart ExternalControl.urp
-    if reload_external_control:
-        if verbose:
-            print("3. Reloading ExternalControl.urp...")
-        dashboard_cmd(host, "close safety popup")
-        dashboard_cmd(host, "unlock protective stop")
-        dashboard_cmd(host, "power on")
-        time.sleep(0.5)
-        dashboard_cmd(host, "brake release")
-        time.sleep(0.5)
-
-        # Load and play ExternalControl
-        result = dashboard_cmd(host, "load /programs/ExternalControl.urp")
-        if verbose:
-            print(f"   Load program: {result}")
-        time.sleep(0.5)
-
-        result = dashboard_cmd(host, "play")
-        if verbose:
-            print(f"   Play program: {result}")
-        time.sleep(1.0)
-
-    # Step 4: Test connection
-    if verbose:
-        print("4. Testing new connection...")
+    # Try to clear RTDE by connecting and immediately disconnecting
     try:
-        test_ctrl = RTDEControlInterface(host)
-        test_ctrl.disconnect()
-        if verbose:
-            print("   ✅ SUCCESS: Can create new control connections!")
+        test_sock = socket.create_connection((host, 30004), timeout=1)
+        test_sock.close()
+        print("  ✓ RTDE port cleared")
+    except:
+        pass
+
+    return True
+
+
+def load_external_control(host):
+    """Load and start ExternalControl.urp on the robot."""
+    print(f"\n[{host}] Loading ExternalControl.urp...")
+
+    try:
+        dash_sock = socket.create_connection((host, 29999), timeout=2)
+        dash_sock.recv(4096)  # Welcome
+
+        # Load the program
+        dash_sock.send(b"load /programs/ExternalControl.urp\n")
+        response = dash_sock.recv(4096).decode()
+
+        if "Error" in response or "not found" in response.lower():
+            print(f"  ✗ Failed to load: {response.strip()}")
+            print("  → Manual action required:")
+            print("    1. On pendant: File → Load Program → ExternalControl.urp")
+            print("    2. Press Play button")
+            return False
+
+        time.sleep(0.5)
+
+        # Play the program
+        dash_sock.send(b"play\n")
+        response = dash_sock.recv(4096).decode()
+
+        if "Error" not in response:
+            print("  ✓ ExternalControl.urp loaded and playing")
+            return True
+        else:
+            print(f"  ✗ Failed to play: {response.strip()}")
+            return False
+
     except Exception as e:
-        success = False
-        if verbose:
-            print(f"   ❌ FAILED: {e}")
-            if reload_external_control:
-                print("\n   Manual fix required:")
-                print("   1. On UR pendant: Stop any running program")
-                print("   2. Load ExternalControl.urp")
-                print("   3. Press Play button")
-                print("   4. Check External Control node settings:")
-                print("      - Host IP = Your PC's IP (NOT robot's IP)")
-                print("      - Port = 50002")
-
-    if verbose:
-        print()
-
-    return success
+        print(f"  ✗ Connection error: {e}")
+        return False
 
 
-def clear_robots_quietly(hosts: list[str]) -> bool:
-    """Clear connections on multiple robots quietly (for use in other scripts).
+def check_program_state(host):
+    """Check if ExternalControl is running."""
+    try:
+        dash_sock = socket.create_connection((host, 29999), timeout=2)
+        dash_sock.recv(4096)  # Welcome
 
-    Args:
-        hosts: List of UR robot IP addresses
+        # Check loaded program
+        dash_sock.send(b"get loaded program\n")
+        loaded = dash_sock.recv(4096).decode()
 
-    Returns:
-        bool: True if all robots cleared successfully
-    """
-    all_success = True
-    for host in hosts:
-        if host:  # Skip None/empty hosts
-            try:
-                success = clear_connections(host, verbose=False, reload_external_control=False)
-                if not success:
-                    all_success = False
-                    print(f"[clear] {host}: Failed to clear connections")
-            except Exception as e:
-                all_success = False
-                print(f"[clear] {host}: Error - {e}")
-    return all_success
+        # Check program state
+        dash_sock.send(b"programState\n")
+        state = dash_sock.recv(4096).decode()
+
+        dash_sock.close()
+
+        is_external = "ExternalControl" in loaded or "external" in loaded.lower()
+        is_playing = "PLAYING" in state.upper()
+
+        return is_external, is_playing, loaded.strip(), state.strip()
+
+    except Exception as e:
+        return False, False, str(e), ""
+
+
+def kill_python_processes():
+    """Kill any existing Python teleop processes."""
+    print("\nKilling existing Python processes...")
+
+    # Kill specific scripts that might be holding connections
+    scripts_to_kill = [
+        "streamdeck_pedal_watch.py",
+        "run_teleop.py",
+        "test_ur_connection.py",
+    ]
+
+    for script in scripts_to_kill:
+        try:
+            result = subprocess.run(
+                ["pkill", "-f", script], capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                print(f"  ✓ Killed {script}")
+        except:
+            pass
 
 
 def main():
-    import argparse
+    """Main function to clear connections and prepare robots."""
+    print("=" * 60)
+    print("UR ROBOT CONNECTION CLEANER")
+    print("=" * 60)
 
-    parser = argparse.ArgumentParser(description="Clear stuck RTDE connections on UR robots")
-    parser.add_argument(
-        "--ur-left", type=str, default="192.168.1.211", help="IP address of left UR robot"
-    )
-    parser.add_argument(
-        "--ur-right", type=str, default="192.168.1.210", help="IP address of right UR robot"
-    )
-    parser.add_argument("--both", action="store_true", help="Clear connections on both robots")
+    # Define robot hosts
+    robots = {"LEFT": "192.168.1.211", "RIGHT": "192.168.1.210"}
 
-    args = parser.parse_args()
+    # Kill existing processes
+    kill_python_processes()
+    time.sleep(1)
 
-    if args.both:
-        clear_connections(args.ur_left, verbose=True, reload_external_control=True)
-        clear_connections(args.ur_right, verbose=True, reload_external_control=True)
+    # Process each robot
+    all_ready = True
+
+    for name, host in robots.items():
+        print(f"\n{'=' * 30}")
+        print(f"{name} ROBOT ({host})")
+        print(f"{'=' * 30}")
+
+        # Clear connections
+        clear_robot_connection(host)
+
+        # Check current state
+        is_external, is_playing, loaded, state = check_program_state(host)
+
+        print("\nCurrent state:")
+        print(f"  Program: {loaded}")
+        print(f"  State: {state}")
+
+        if not is_external or not is_playing:
+            # Try to load ExternalControl
+            if load_external_control(host):
+                print(f"  ✓ {name} robot ready")
+            else:
+                print(f"\n⚠️  {name} robot needs manual setup:")
+                print(f"  1. On pendant for {host}:")
+                print("     - Stop any running program")
+                print("     - File → Load Program → ExternalControl.urp")
+                print("     - Press Play (▶)")
+                print("     - Enable Remote Control if prompted")
+                print("  2. Then run this script again")
+                all_ready = False
+        else:
+            print("  ✓ ExternalControl already running")
+
+    print("\n" + "=" * 60)
+    if all_ready:
+        print("✅ ALL ROBOTS READY FOR TELEOPERATION")
+        print("\nYou can now run:")
+        print("  python3 scripts/run_teleop.py")
+        print("\nOr for test mode:")
+        print("  python3 scripts/run_teleop.py --test-mode")
     else:
-        print("Clearing connections on left UR by default...")
-        print("Use --both to clear both robots, or specify IPs with --ur-left/--ur-right")
-        clear_connections(args.ur_left, verbose=True, reload_external_control=True)
+        print("⚠️  MANUAL SETUP REQUIRED")
+        print("Complete the steps above, then run this script again")
+    print("=" * 60)
 
-    print("\n" + "=" * 50)
-    print("DONE! You can now run your teleop script.")
-    print("=" * 50)
+    return 0 if all_ready else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

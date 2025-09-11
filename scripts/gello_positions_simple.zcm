@@ -1,0 +1,9 @@
+struct gello_positions_t
+{
+    int64_t timestamp;
+    double joint_positions[6];
+    double gripper_position;
+    double joint_velocities[6];
+    boolean is_valid;
+    string arm_side;
+}

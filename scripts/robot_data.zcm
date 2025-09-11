@@ -1,0 +1,7 @@
+struct robot_data_t {
+    int64_t timestamp;
+    string robot_id;
+    double joint_angles[6];
+    double temperature;
+    boolean is_moving;
+}

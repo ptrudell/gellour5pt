@@ -1,0 +1,11 @@
+package gello_msgs;
+
+struct gello_positions_t
+{
+    int64_t timestamp;        // Timestamp in microseconds
+    double joint_positions[6]; // 6 joint positions in radians
+    double gripper_position;   // Gripper position in radians
+    double joint_velocities[6]; // 6 joint velocities in rad/s
+    boolean is_valid;          // Data validity flag
+    string arm_side;           // "left" or "right"
+}

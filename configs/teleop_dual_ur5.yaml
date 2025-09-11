@@ -30,18 +30,18 @@ dynamixel:
 control:
   hz: 125  # Control frequency
   dt: 0.008  # 1/125
-  lookahead: 0.15
-  gain: 340
-  velocity_max: 1.4  # rad/s - can be overridden by UR_VMAX env var
-  acceleration_max: 4.0  # rad/s² - can be overridden by UR_AMAX env var
+  lookahead: 0.08  # Reduced for tighter control
+  gain: 180  # Reduced for smoother control
+  velocity_max: 0.6  # rad/s - reduced for smoother control
+  acceleration_max: 1.5  # rad/s² - reduced to prevent jerky motion
   gripper_enabled: true  # Enable gripper control via 7th DXL joint
   gripper_threshold: 0.1  # Threshold for gripper motion detection
 
 # Motion shaping parameters
 motion_shaping:
-  ema_alpha: 0.03  # ULTRA smooth to prevent drift (was 0.06)
-  softstart_time: 0.15  # Slower startup to prevent jerks (was 0.10)
-  deadband_deg: [0.8, 0.8, 0.8, 0.8, 0.8, 1.2, 0.8]  # Larger deadbands to completely eliminate drift
+  ema_alpha: 0.015  # Extra smoothing to prevent oscillations
+  softstart_time: 0.3  # Slower startup to prevent jerks
+  deadband_deg: [2.0, 2.0, 2.0, 2.0, 2.0, 3.0, 2.0]  # Much larger deadbands to eliminate wild movements
   scale: [1, 1, 1, 1, 1, 1, 1]  # Per-joint gains + gripper
   clamp_rad: [null, null, null, null, null, 0.8, null]  # Wrist clamp
   

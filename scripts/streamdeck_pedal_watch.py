@@ -37,13 +37,32 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import yaml
 
+# Try to import ZCM for message publishing
+try:
+    import zerocm
+    from gello_positions_t import gello_positions_t
+
+    ZCM_AVAILABLE = True
+except ImportError:
+    print(
+        "[warn] zerocm not installed or message types not generated, position publishing disabled"
+    )
+    print("      Install with: pip install zerocm")
+    print("      Generate messages with:")
+    print("      zcm-gen -p gello_positions_simple.zcm")
+    ZCM_AVAILABLE = False
+
+# RTDE imports removed - now handled by separate gello_ur_offset_publisher.py
+
 # Import optimized components
 from hardware.control_loop import (
     FixedRateScheduler,
     MotionProfile,
     SmoothMotionController,
 )
-from hardware.ur_dynamixel_robot import URDynamixelRobot
+from hardware.ur_dynamixel_robot import (
+    DynamixelDriver,  # DynamixelDriver for testing mode
+)
 
 # Import connection clearing utility
 try:
@@ -309,7 +328,7 @@ def _check_external_control(host: str) -> bool:
         return False
 
 
-def _safe_get_q(robot: URDynamixelRobot) -> Optional[np.ndarray]:
+def _safe_get_q(robot) -> Optional[np.ndarray]:
     """Safely get current joint positions from robot."""
     try:
         positions = robot.ur.get_joint_positions()
@@ -641,11 +660,369 @@ class PedalMonitor:
         self.last_buttons = current_buttons
 
 
+class PositionMonitor:
+    """Background thread to continuously monitor and print GELLO arm positions."""
+
+    def __init__(
+        self,
+        left_robot,  # Any robot type with dxl attribute
+        right_robot,  # Any robot type with dxl attribute
+        rate_hz: float = 10.0,  # Print rate (10Hz = 10 times per second)
+        publish_zcm: bool = True,  # Enable ZCM publishing
+    ):
+        self.left_robot = left_robot
+        self.right_robot = right_robot
+        self.rate_hz = rate_hz
+        self.publish_zcm = publish_zcm and ZCM_AVAILABLE
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        
+        # For angle unwrapping to fix multi-turn issues
+        self.prev_left_continuous = None  # List of continuous angles for left arm
+        self.prev_right_continuous = None  # List of continuous angles for right arm
+
+        # Initialize ZCM if available
+        self.zcm = None
+        self.left_channel = "gello_positions_left"
+        self.right_channel = "gello_positions_right"
+
+        if self.publish_zcm:
+            try:
+                self.zcm = zerocm.ZCM()
+                if self.zcm.good():
+                    self.zcm.start()
+                    print("[ZCM] Publishing to channels:")
+                    print(f"      - {self.left_channel} (left arm positions)")
+                    print(f"      - {self.right_channel} (right arm positions)")
+                else:
+                    print("[ZCM] Failed to initialize ZCM")
+                    self.zcm = None
+                    self.publish_zcm = False
+            except Exception as e:
+                print(f"[ZCM] Error initializing: {e}")
+                self.zcm = None
+                self.publish_zcm = False
+
+    def start(self) -> None:
+        """Start the monitoring thread."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._monitor_loop, daemon=True, name="position_monitor"
+        )
+        self._thread.start()
+        print(f"[MONITOR] Position monitoring started ({self.rate_hz}Hz)")
+
+    def stop(self) -> None:
+        """Stop the monitoring thread."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        # Clean up ZCM
+        if self.zcm:
+            try:
+                self.zcm.stop()
+            except Exception:
+                pass
+
+    def update_robots(
+        self,
+        left_robot,  # Any robot type with dxl attribute
+        right_robot,  # Any robot type with dxl attribute
+    ) -> None:
+        """Update robot references (for when robots are rebuilt)."""
+        self.left_robot = left_robot
+        self.right_robot = right_robot
+
+    def _publish_positions(
+        self, channel: str, positions: Optional[List[float]], arm_side: str
+    ) -> None:
+        """Publish GELLO positions to ZCM channel.
+
+        Args:
+            channel: ZCM channel name
+            positions: List of positions [j1, j2, j3, j4, j5, j6, gripper] in radians
+            arm_side: "left" or "right"
+        """
+        if not self.publish_zcm or not self.zcm or positions is None:
+            return
+
+        try:
+            # Create message
+            msg = gello_positions_t()
+            msg.timestamp = int(time.time() * 1e6)  # microseconds
+            msg.arm_side = arm_side
+
+            if positions is not None and len(positions) >= 6:
+                # Set joint positions (first 6 values)
+                msg.joint_positions = list(positions[:6])
+
+                # Set gripper position if available
+                if len(positions) > 6:
+                    msg.gripper_position = float(positions[6])
+                else:
+                    msg.gripper_position = 0.0
+
+                # Zero velocities for now (could be computed later)
+                msg.joint_velocities = [0.0] * 6
+                msg.is_valid = True
+            else:
+                # Invalid data - set defaults
+                msg.joint_positions = [0.0] * 6
+                msg.gripper_position = 0.0
+                msg.joint_velocities = [0.0] * 6
+                msg.is_valid = False
+
+            # Publish the message
+            self.zcm.publish(channel, msg)
+
+        except Exception:
+            # Silently ignore publish errors to not interfere with operation
+            pass
+
+    # Transform and UR5 offset publishing methods removed
+    # Now handled by separate gello_ur_offset_publisher.py
+    
+    def _wrap_to_pi(self, angle_rad: float) -> float:
+        """Wrap angle to [-pi, pi] range."""
+        import math
+        return ((angle_rad + math.pi) % (2 * math.pi)) - math.pi
+    
+    def _unwrap_angle(self, prev_continuous: Optional[float], curr_wrapped: float) -> float:
+        """Unwrap angle to maintain continuity (no jumps).
+        
+        Args:
+            prev_continuous: Previous continuous angle (None for first reading)
+            curr_wrapped: Current wrapped angle in [-pi, pi]
+        
+        Returns:
+            Continuous angle that doesn't jump
+        """
+        import math
+        
+        if prev_continuous is None:
+            return curr_wrapped
+        
+        # Calculate the smallest delta considering wrapping
+        delta = curr_wrapped - (prev_continuous % (2 * math.pi) - math.pi)
+        if delta > math.pi:
+            delta -= 2 * math.pi
+        elif delta < -math.pi:
+            delta += 2 * math.pi
+            
+        return prev_continuous + delta
+    
+    def _fix_multiturn_positions(self, positions: Optional[List[float]], 
+                                 prev_continuous: Optional[List[float]],
+                                 side: str) -> Optional[List[float]]:
+        """Fix multi-turn accumulation issues in joint positions.
+        
+        Args:
+            positions: Raw positions from Dynamixel (may have multi-turn accumulation)
+            prev_continuous: Previous continuous positions for this arm
+            side: 'left' or 'right' for debugging
+            
+        Returns:
+            Fixed positions with proper wrapping/unwrapping
+        """
+        if positions is None:
+            return None
+            
+        import math
+        
+        # Initialize previous if needed
+        if prev_continuous is None:
+            prev_continuous = [None] * len(positions)
+        
+        fixed_positions = []
+        for i, raw_pos in enumerate(positions):
+            # First wrap to [-pi, pi]
+            wrapped = self._wrap_to_pi(raw_pos)
+            
+            # Check for bogus values (like the 377 million degrees issue)
+            if abs(raw_pos) > 100 * 2 * math.pi:  # More than 100 rotations is suspicious
+                # Use wrapped value directly for bogus readings
+                continuous = wrapped
+                if i < len(prev_continuous):
+                    prev_continuous[i] = continuous
+            else:
+                # Unwrap to maintain continuity
+                prev = prev_continuous[i] if i < len(prev_continuous) else None
+                continuous = self._unwrap_angle(prev, wrapped)
+                
+                # Sanity check: reject impossible jumps (more than 90 degrees in one sample)
+                if prev is not None and abs(continuous - prev) > math.pi/2:
+                    # Keep previous value on suspicious jump
+                    continuous = prev
+                
+                # Update previous
+                if i < len(prev_continuous):
+                    prev_continuous[i] = continuous
+            
+            fixed_positions.append(continuous)
+        
+        return fixed_positions
+
+    def _monitor_loop(self) -> None:
+        """Main monitoring loop."""
+        # Minimal sleep for maximum responsiveness
+        sleep_time = 0.002  # 2ms minimum sleep (can handle up to 500Hz)
+        debug_counter = 0
+        simulate_positions = (
+            True  # Flag to use simulated data when robots not available
+        )
+        last_publish_time = 0  # Track time for rate limiting ZCM publishes
+
+        while not self._stop.is_set():
+            try:
+                # Read positions from both arms
+                left_pos = None
+                right_pos = None
+
+                if self.left_robot and self.left_robot.dxl:
+                    try:
+                        raw_left = self.left_robot.dxl.read_positions()
+                        if raw_left is not None:
+                            # Fix multi-turn accumulation issues
+                            if self.prev_left_continuous is None:
+                                self.prev_left_continuous = [None] * len(raw_left)
+                            left_pos = self._fix_multiturn_positions(
+                                raw_left, self.prev_left_continuous, 'left'
+                            )
+                            simulate_positions = False  # Got real data
+                    except Exception as e:
+                        if debug_counter % 100 == 0:  # Print every 10 seconds at 10Hz
+                            print(f"[MONITOR] Left DXL read error: {e}")
+
+                if self.right_robot and self.right_robot.dxl:
+                    try:
+                        raw_right = self.right_robot.dxl.read_positions()
+                        if raw_right is not None:
+                            # Fix multi-turn accumulation issues
+                            if self.prev_right_continuous is None:
+                                self.prev_right_continuous = [None] * len(raw_right)
+                            right_pos = self._fix_multiturn_positions(
+                                raw_right, self.prev_right_continuous, 'right'
+                            )
+                            simulate_positions = False  # Got real data
+                    except Exception as e:
+                        if debug_counter % 100 == 0:  # Print every 10 seconds at 10Hz
+                            print(f"[MONITOR] Right DXL read error: {e}")
+
+                # If no real data available, use simulated positions for testing
+                if simulate_positions and self.publish_zcm:
+                    import math
+
+                    phase = debug_counter * 0.01  # Slow sine wave
+
+                    # Simulated left arm positions (7 joints: 6 arm + 1 gripper)
+                    left_pos = [
+                        -0.785 + 0.1 * math.sin(phase),  # J1
+                        -1.571 + 0.05 * math.cos(phase),  # J2
+                        0.0 + 0.02 * math.sin(phase * 2),  # J3
+                        -1.571 + 0.05 * math.cos(phase),  # J4
+                        1.571 + 0.05 * math.sin(phase),  # J5
+                        0.0 + 0.02 * math.cos(phase * 2),  # J6
+                        0.5 + 0.3 * math.sin(phase * 0.5),  # Gripper
+                    ]
+
+                    # Simulated right arm positions (slightly different phase)
+                    right_pos = [
+                        -0.790 + 0.1 * math.sin(phase + 0.5),  # J1
+                        -1.570 + 0.05 * math.cos(phase + 0.5),  # J2
+                        0.001 + 0.02 * math.sin(phase * 2 + 0.5),  # J3
+                        -1.572 + 0.05 * math.cos(phase + 0.5),  # J4
+                        1.570 + 0.05 * math.sin(phase + 0.5),  # J5
+                        0.001 + 0.02 * math.cos(phase * 2 + 0.5),  # J6
+                        0.6 + 0.3 * math.sin(phase * 0.5 + 0.5),  # Gripper
+                    ]
+
+                    if debug_counter == 0 or debug_counter == 10:
+                        print(
+                            "[MONITOR] Using SIMULATED positions for ZCM (no robots connected)"
+                        )
+
+                # Debug: Print publishing status periodically
+                if debug_counter % 100 == 0:  # Every 10 seconds at 10Hz
+                    mode = "SIMULATED" if simulate_positions else "REAL"
+                    print(
+                        f"[ZCM DEBUG] Mode={mode}, publish_zcm={self.publish_zcm}, zcm={self.zcm is not None}, left_pos={left_pos is not None}, right_pos={right_pos is not None}"
+                    )
+
+                # Publish positions to ZCM at specified rate
+                current_time = time.time()
+                publish_interval = 1.0 / self.rate_hz  # 10Hz = 0.1 seconds
+                
+                if self.publish_zcm and (current_time - last_publish_time) >= publish_interval:
+                    self._publish_positions(self.left_channel, left_pos, "left")
+                    self._publish_positions(self.right_channel, right_pos, "right")
+                    last_publish_time = current_time
+
+                    # Debug: Count successful publishes
+                    if debug_counter % 500 == 0 and (left_pos or right_pos):  # Adjusted for faster loop
+                        mode = "SIMULATED" if simulate_positions else "REAL"
+                        print(
+                            f"[ZCM] Publishing {mode} data: left={left_pos is not None}, right={right_pos is not None}"
+                        )
+
+                # Format and print positions at 10Hz (separate from loop rate)
+                if (current_time - last_publish_time) < publish_interval * 0.9:
+                    # Skip printing if we're not near a publish time
+                    pass
+                else:
+                    timestamp = time.strftime("%H:%M:%S")
+
+                    # Build position strings
+                    left_str = "DISCONNECTED"
+                    right_str = "DISCONNECTED"
+
+                    if left_pos is not None:
+                        # Format: J1:xx.x° J2:xx.x° ... J7:xx.x° (gripper)
+                        left_joints = [
+                            f"J{i + 1}:{np.degrees(p):6.1f}°"
+                            for i, p in enumerate(left_pos[:6])
+                        ]
+                        left_gripper = (
+                            f"J7:{np.degrees(left_pos[6]):6.1f}°"
+                            if len(left_pos) > 6
+                            else "J7:---"
+                        )
+                        left_str = " ".join(left_joints) + " " + left_gripper
+
+                    if right_pos is not None:
+                        # Format: J10:xx.x° J11:xx.x° ... J16:xx.x° (gripper)
+                        right_joints = [
+                            f"J{i + 10}:{np.degrees(p):6.1f}°"
+                            for i, p in enumerate(right_pos[:6])
+                        ]
+                        right_gripper = (
+                            f"J16:{np.degrees(right_pos[6]):6.1f}°"
+                            if len(right_pos) > 6
+                            else "J16:---"
+                        )
+                        right_str = " ".join(right_joints) + " " + right_gripper
+
+                    # Print in a clean format
+                    print(f"\r[{timestamp}] GELLO LEFT:  {left_str}", end="")
+                    print(f"\n           GELLO RIGHT: {right_str}", end="")
+
+                    print("\033[1A", end="", flush=True)  # Move cursor up 1 line
+
+            except Exception as e:
+                # Log errors periodically
+                if debug_counter % 100 == 0:
+                    print(f"[MONITOR] Loop error: {e}")
+
+            debug_counter += 1
+            time.sleep(sleep_time)
+
+
 class FollowThread:
     def __init__(
         self,
-        left_robot: Optional[URDynamixelRobot],
-        right_robot: Optional[URDynamixelRobot],
+        left_robot,  # Any robot type with dxl and ur attributes
+        right_robot,  # Any robot type with dxl and ur attributes
         config: Config,
     ):
         self.left_robot = left_robot
@@ -775,11 +1152,11 @@ class FollowThread:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=1.0)
-        # Stop robots
-        if self.left_robot:
-            self.left_robot.ur.stop_j(self.config.amax)
-        if self.right_robot:
-            self.right_robot.ur.stop_j(self.config.amax)
+        # Stop robots - COMMENTED OUT FOR TESTING
+        # if self.left_robot:
+        #     self.left_robot.ur.stop_j(self.config.amax)
+        # if self.right_robot:
+        #     self.right_robot.ur.stop_j(self.config.amax)
 
     def _send_gripper_command(self, side: str, position: float):
         """Send gripper command via the dexgpt debug_tools script."""
@@ -830,7 +1207,7 @@ class FollowThread:
                 print(f"[gripper] Error sending command: {e}")
             pass
 
-    def _ensure_ur_ready(self, robot: URDynamixelRobot) -> bool:
+    def _ensure_ur_ready(self, robot) -> bool:
         """Ensure UR is ready for control."""
         if not robot.ur.ensure_control():
             print(f"[follow] {robot.ur.host}: RTDE control not available")
@@ -868,6 +1245,7 @@ class FollowThread:
                 ur_pos = self.left_robot.ur.get_joint_positions()
 
                 if dxl_pos is not None and ur_pos is not None:
+                    print(f"[LEFT] dxl_pos: {dxl_pos}")
                     # Auto-initialize baselines on first run if needed
                     if self.left_controller._baseline_dxl is None:
                         self.left_controller.set_baselines(dxl_pos[:6], ur_pos)
@@ -921,29 +1299,30 @@ class FollowThread:
                             self._left_last_sent_cmd = gripper_cmd
                             self._send_gripper_command("left", gripper_cmd)
 
-                    # Send servoJ command
-                    try:
-                        success = self.left_robot.ur.servo_j(
-                            target,
-                            self.config.vmax,
-                            self.config.amax,
-                            self.config.dt,
-                            self.config.lookahead,
-                            self.config.gain,
-                        )
-                        if success:
-                            self.error_count["left"] = 0
-                        else:
-                            raise RuntimeError("servoJ failed")
-                    except Exception as e:
-                        self.error_count["left"] += 1
-                        if self.error_count["left"] == 1:
-                            print(f"\n⚠️  LEFT UR: Control error - {e}")
-                            print("     Ensure ExternalControl.urp is PLAYING")
-                        if self.error_count["left"] >= self.max_errors:
-                            print("   Too many errors - stopping for safety")
-                            self._stop.set()
-                            return
+                    # Send servoJ command - COMMENTED OUT FOR TESTING
+                    # try:
+                    #     success = self.left_robot.ur.servo_j(
+                    #         target,
+                    #         self.config.vmax,
+                    #         self.config.amax,
+                    #         self.config.dt,
+                    #         self.config.lookahead,
+                    #         self.config.gain,
+                    #     )
+                    #     if success:
+                    #         self.error_count["left"] = 0
+                    #     else:
+                    #         raise RuntimeError("servoJ failed")
+                    # except Exception as e:
+                    #     self.error_count["left"] += 1
+                    #     if self.error_count["left"] == 1:
+                    #         print(f"\n⚠️  LEFT UR: Control error - {e}")
+                    #         print("     Ensure ExternalControl.urp is PLAYING")
+                    #     if self.error_count["left"] >= self.max_errors:
+                    #         print("   Too many errors - stopping for safety")
+                    #         self._stop.set()
+                    #         return
+                    self.error_count["left"] = 0  # Keep counter reset
 
             # RIGHT robot control
             if self.right_robot and self.right_controller:
@@ -1006,29 +1385,30 @@ class FollowThread:
                             self._right_last_sent_cmd = gripper_cmd
                             self._send_gripper_command("right", gripper_cmd)
 
-                    # Send servoJ command
-                    try:
-                        success = self.right_robot.ur.servo_j(
-                            target,
-                            self.config.vmax,
-                            self.config.amax,
-                            self.config.dt,
-                            self.config.lookahead,
-                            self.config.gain,
-                        )
-                        if success:
-                            self.error_count["right"] = 0
-                        else:
-                            raise RuntimeError("servoJ failed")
-                    except Exception as e:
-                        self.error_count["right"] += 1
-                        if self.error_count["right"] == 1:
-                            print(f"\n⚠️  RIGHT UR: Control error - {e}")
-                            print("     Ensure ExternalControl.urp is PLAYING")
-                        if self.error_count["right"] >= self.max_errors:
-                            print("   Too many errors - stopping for safety")
-                            self._stop.set()
-                            return
+                    # Send servoJ command - COMMENTED OUT FOR TESTING
+                    # try:
+                    #     success = self.right_robot.ur.servo_j(
+                    #         target,
+                    #         self.config.vmax,
+                    #         self.config.amax,
+                    #         self.config.dt,
+                    #         self.config.lookahead,
+                    #         self.config.gain,
+                    #     )
+                    #     if success:
+                    #         self.error_count["right"] = 0
+                    #     else:
+                    #         raise RuntimeError("servoJ failed")
+                    # except Exception as e:
+                    #     self.error_count["right"] += 1
+                    #     if self.error_count["right"] == 1:
+                    #         print(f"\n⚠️  RIGHT UR: Control error - {e}")
+                    #         print("     Ensure ExternalControl.urp is PLAYING")
+                    #     if self.error_count["right"] >= self.max_errors:
+                    #         print("   Too many errors - stopping for safety")
+                    #         self._stop.set()
+                    #         return
+                    self.error_count["right"] = 0  # Keep counter reset
 
             # Wait for next tick
             self.scheduler.wait()
@@ -1048,8 +1428,8 @@ def _build_robot(
     config: Config,
     side: str,  # "left" or "right"
     retry_dxl: bool = True,
-) -> Optional[URDynamixelRobot]:
-    """Build a URDynamixelRobot from config with better error handling."""
+):  # Returns DynamixelOnlyRobot in testing mode
+    """Build a robot from config (DynamixelOnly in testing mode)."""
     robot_config = getattr(config, f"{side}_robot", {})
 
     if not robot_config:
@@ -1066,16 +1446,54 @@ def _build_robot(
     dxl_signs = robot_config.get("dxl_signs", [1] * len(dxl_ids))
     dxl_offsets = robot_config.get("dxl_offsets_deg", [0.0] * len(dxl_ids))
 
-    # Create robot
-    robot = URDynamixelRobot(
-        ur_host=ur_host,
-        dxl_port=dxl_port,
-        dxl_ids=dxl_ids,
-        dxl_signs=dxl_signs,
-        dxl_offsets_deg=dxl_offsets,
-        dxl_baudrate=config.dynamixel.get("baudrate", 1000000),
-        control_frequency=config.hz,
+    # Create robot - MODIFIED FOR TESTING: Only Dynamixel, no UR5
+    # Using a wrapper class to avoid UR5 connection
+    class MockUR:
+        """Mock UR class that does nothing"""
+
+        def __init__(self):
+            self.host = ur_host
+
+        def get_joint_positions(self):
+            return [0.0] * 6  # Return dummy positions
+
+        def servo_j(self, *args, **kwargs):
+            return True  # Always succeed
+
+        def stop_j(self, *args):
+            pass  # Do nothing
+
+        def ensure_control(self):
+            return True  # Always ready
+
+    class DynamixelOnlyRobot:
+        def __init__(self, dxl_driver, ur_host):
+            self.dxl = dxl_driver
+            self.ur = MockUR()  # Mock UR5 object
+
+        def connect(self):
+            dxl_ok = self.dxl.connect()
+            return False, dxl_ok  # Always return False for UR5
+
+        def disconnect(self):
+            self.dxl.disconnect()
+
+        def set_dxl_torque(self, enabled):
+            self.dxl.set_torque_enabled(enabled)
+
+    # Import DynamixelDriver
+
+    # Create Dynamixel driver
+    dxl_driver = DynamixelDriver(
+        port=dxl_port,
+        ids=dxl_ids,
+        signs=dxl_signs,
+        offsets_deg=dxl_offsets,
+        baudrate=config.dynamixel.get("baudrate", 1000000),
     )
+
+    # Create wrapper robot
+    robot = DynamixelOnlyRobot(dxl_driver, ur_host)
 
     # Connect with retry logic for DXL
     ur_ok, dxl_ok = robot.connect()
@@ -1088,7 +1506,7 @@ def _build_robot(
         dxl_ok = robot.dxl.connect()
 
     print(
-        f"[{side}] UR: {'connected' if ur_ok else 'FAILED'}, DXL: {'connected' if dxl_ok else 'FAILED'}"
+        f"[{side}] UR: DISABLED (Testing Mode), DXL: {'connected' if dxl_ok else 'FAILED'}"
     )
 
     if not dxl_ok:
@@ -1150,6 +1568,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--test-mode", action="store_true", help="Auto-start without pedals"
     )
+    ap.add_argument(
+        "--no-zcm", action="store_true", help="Disable ZCM position publishing"
+    )
 
     args = ap.parse_args(argv)
 
@@ -1179,6 +1600,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not (left_robot or right_robot):
         print("[exit] No robots configured - check config file")
         return 2
+
+    # Create position monitor (runs in background at all times)
+    position_monitor = PositionMonitor(
+        left_robot,
+        right_robot,
+        rate_hz=10.0,  # Publish 10 times per second
+        publish_zcm=(not args.no_zcm),
+    )
+    position_monitor.start()
 
     # DXL diagnostic test mode
     if args.dxl_test:
@@ -1246,7 +1676,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Print startup diagnostics
     print("\n" + "=" * 60)
-    print("TELEOP STARTUP DIAGNOSTICS")
+    print("TELEOP STARTUP DIAGNOSTICS (UR5 CONTROL DISABLED FOR TESTING)")
     print("=" * 60)
     print(f"Config: {args.config}")
     print(f"Speed: VMAX={config.vmax:.2f} rad/s, AMAX={config.amax:.1f} rad/s²")
@@ -1284,12 +1714,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             print("[dxl] Torque OFF (passive mode)")
 
-        # Prepare UR robots
-        if not args.no_dashboard:
-            for robot, side in [(left_robot, "LEFT"), (right_robot, "RIGHT")]:
-                if robot:
-                    print(f"[init] Preparing {side} UR at {robot.ur.host}...")
-                    _dashboard_play(robot.ur.host)
+        # Prepare UR robots - COMMENTED OUT FOR TESTING
+        # if not args.no_dashboard:
+        #     for robot, side in [(left_robot, "LEFT"), (right_robot, "RIGHT")]:
+        #         if robot:
+        #             print(f"[init] Preparing {side} UR at {robot.ur.host}...")
+        #             _dashboard_play(robot.ur.host)
 
         # Create follow thread
         ft = FollowThread(
@@ -1317,11 +1747,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if ft._thread and ft._thread.is_alive():
                 ft.stop()
 
-            # Stop and disconnect robots
+            # Stop and disconnect robots - UR STOP COMMENTED OUT FOR TESTING
             for robot in (left_robot, right_robot):
                 if robot:
-                    robot.ur.stop_j(config.amax)
-                    time.sleep(0.05)
+                    # robot.ur.stop_j(config.amax)  # COMMENTED OUT FOR TESTING
+                    # time.sleep(0.05)  # COMMENTED OUT FOR TESTING
                     robot.disconnect()
 
             # Reset controllers
@@ -1333,6 +1763,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # Clear robot references so they get rebuilt on next use
             left_robot = None
             right_robot = None
+
+            # Update position monitor to clear references
+            position_monitor.update_robots(None, None)
 
         def on_center_first():
             """PREP: capture baselines, gentle mode, no streaming yet."""
@@ -1351,15 +1784,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if right_robot:
                     ft.right_robot = right_robot
 
+            # Update position monitor with new robot references
+            position_monitor.update_robots(left_robot, right_robot)
+
             _saved_mode = _set_gentle_mode(config)
 
             # Capture baselines with error checking
             ft.capture_baselines()
 
-            # Ensure UR control is ready
-            for robot in (left_robot, right_robot):
-                if robot:
-                    robot.ur.ensure_control()
+            # Ensure UR control is ready - COMMENTED OUT FOR TESTING
+            # for robot in (left_robot, right_robot):
+            #     if robot:
+            #         robot.ur.ensure_control()
 
         def on_center_second():
             """START: restore full params and begin streaming."""
@@ -1382,7 +1818,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print("   Check servo power and connections")
                 return
 
-            print("\n✅ Starting teleoperation!")
+            print("\n✅ Starting teleoperation (UR5 CONTROL DISABLED FOR TESTING)!")
+            print("   📡 Publishing GELLO positions to ZCM")
+            print("   ❌ NOT sending commands to UR5 robots")
             ft.start()
 
         def on_right_stop():
@@ -1529,9 +1967,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Cleanup
         print("\n[cleanup] Shutting down...")
 
+        # Stop position monitor
+        if "position_monitor" in locals():
+            position_monitor.stop()
+
         # Stop pedal monitoring
         if pedal_monitor and pedal_monitor.device:
             pedal_monitor.stop_monitoring()
+
+        # Transform display stops automatically with position monitor
 
         # Disconnect robots
         if left_robot:
